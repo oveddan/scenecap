@@ -26,10 +26,20 @@ const (
 )
 
 type CommandResult struct {
-	Output    string `json:"output"`
-	Truncated bool   `json:"truncated,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Output    string        `json:"output"`
+	Truncated bool          `json:"truncated,omitempty"`
+	Status    CommandStatus `json:"status,omitempty"`
+	Error     string        `json:"error,omitempty"`
 }
+
+type CommandStatus string
+
+const (
+	CommandCompleted CommandStatus = "completed"
+	CommandFailed    CommandStatus = "failed"
+	CommandTimedOut  CommandStatus = "timed_out"
+	CommandCanceled  CommandStatus = "canceled"
+)
 
 type Runner interface {
 	Run(context.Context, string, []string, int) CommandResult
@@ -69,14 +79,20 @@ func (r ExecRunner) Run(ctx context.Context, name string, args []string, limit i
 	}
 	cmd.WaitDelay = time.Second
 	err := cmd.Run()
-	result := CommandResult{Output: strings.TrimSpace(output.String()), Truncated: output.truncated}
+	captured, truncated := output.snapshot()
+	result := CommandResult{Output: strings.TrimSpace(captured), Truncated: truncated}
 	switch {
 	case err != nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+		result.Status = CommandTimedOut
 		result.Error = fmt.Sprintf("command timed out after %s", timeout)
 	case err != nil && errors.Is(runCtx.Err(), context.Canceled):
+		result.Status = CommandCanceled
 		result.Error = "command canceled"
 	case err != nil:
+		result.Status = CommandFailed
 		result.Error = err.Error()
+	default:
+		result.Status = CommandCompleted
 	}
 	return result
 }
@@ -104,10 +120,10 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (b *limitedBuffer) String() string {
+func (b *limitedBuffer) snapshot() (string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return string(b.data)
+	return string(b.data), b.truncated
 }
 
 type ExecutableIdentity struct {
@@ -425,17 +441,26 @@ func WriteEvidence(ctx context.Context, opts EvidenceOptions) (string, Evidence,
 		}
 		evidence.Executables[name] = identity
 	}
+	if err := ctx.Err(); err != nil {
+		return "", Evidence{}, fmt.Errorf("collect executable evidence: %w", err)
+	}
 	ffmpegPath := evidence.Executables["ffmpeg"].CanonicalPath
 	ffmpegIdentity := evidence.Executables["ffmpeg"].FileIdentity()
 	evidence.FFmpeg = inspectFFmpeg(ctx, opts.Runner, ffmpegPath)
 	if err := VerifyFileIdentity(ffmpegIdentity); err != nil {
 		return "", Evidence{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return "", Evidence{}, fmt.Errorf("collect FFmpeg evidence: %w", err)
+	}
 	data, err := json.MarshalIndent(evidence, "", "  ")
 	if err != nil {
 		return "", Evidence{}, fmt.Errorf("encode evidence: %w", err)
 	}
 	data = append(data, '\n')
+	if err := ctx.Err(); err != nil {
+		return "", Evidence{}, fmt.Errorf("write evidence: %w", err)
+	}
 	if err := atomicWrite(path, data, 0o644); err != nil {
 		return "", Evidence{}, err
 	}
@@ -544,7 +569,7 @@ type EncoderCheck struct {
 	Version     int                `json:"version"`
 	Executable  ExecutableIdentity `json:"ffmpeg"`
 	Listed      *bool              `json:"h264_videotoolbox_listed"`
-	Operational bool               `json:"h264_videotoolbox_operational"`
+	Operational *bool              `json:"h264_videotoolbox_operational"`
 	Listing     CommandResult      `json:"encoder_listing"`
 	Probe       CommandResult      `json:"operational_probe"`
 }
@@ -573,10 +598,18 @@ func CheckEncoder(ctx context.Context, runner Runner, requested string) (Encoder
 		Version:     2,
 		Executable:  identity,
 		Listed:      listedConclusion(listing, "h264_videotoolbox"),
-		Operational: probe.Error == "",
+		Operational: operationalConclusion(probe),
 		Listing:     listing,
 		Probe:       probe,
 	}, nil
+}
+
+func operationalConclusion(result CommandResult) *bool {
+	if result.Status == CommandCanceled || result.Status == CommandTimedOut {
+		return nil
+	}
+	operational := result.Error == ""
+	return &operational
 }
 
 func EncoderProbeArgs() []string {

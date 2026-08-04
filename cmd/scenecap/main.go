@@ -180,7 +180,10 @@ func encoderCheck(args []string) error {
 		return fmt.Errorf("encode encoder check: %w", err)
 	}
 	fmt.Println(string(data))
-	if !result.Operational {
+	if result.Operational == nil {
+		return errors.New("h264_videotoolbox operational probe was incomplete; see diagnostics above")
+	}
+	if !*result.Operational {
 		return errors.New("h264_videotoolbox is not operational; see diagnostics above")
 	}
 	return nil

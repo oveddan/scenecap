@@ -40,7 +40,9 @@ FFmpeg lists it and whether a one-frame synthetic `lavfi` encode actually
 works. A listed encoder can still be non-operational, in which case the command
 prints JSON diagnostics and exits nonzero.
 Encoder-check schema version 2 applies the same `true`/`false`/`null` rule to
-the encoder listing while reporting operational probe success separately.
+the encoder listing. Its operational result is `null` when cancellation or a
+timeout prevented the probe from completing, `false` for a completed failed
+probe, and `true` only for a completed successful encode.
 
 `devices` and `record` cross the privacy boundary and may trigger macOS privacy
 prompts. Both accept `--ffmpeg`; `record` also accepts `--ffprobe`. See

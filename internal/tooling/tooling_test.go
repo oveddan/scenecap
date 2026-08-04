@@ -67,6 +67,9 @@ func TestWriteEvidenceWritesValidJSONWithoutTempAndRepresentsCodesignFailures(t 
 	if evidence.Executables["ffmpeg"].Codesign.Verification.Error == "" || stored.Executables["scenecap"].Codesign.Display.Error == "" {
 		t.Fatal("codesign failures were not represented in evidence")
 	}
+	if !isTrue(evidence.FFmpeg.AVFoundationCompiled) || !isTrue(stored.FFmpeg.AVFoundationCompiled) {
+		t.Fatal("AVFoundation positive help marker was not parsed as compiled")
+	}
 	if !isTrue(evidence.FFmpeg.AVFoundationListed) || !isTrue(stored.FFmpeg.AVFoundationListed) {
 		t.Fatal("AVFoundation was not parsed from the FFmpeg devices listing")
 	}
@@ -97,6 +100,9 @@ func TestExecRunnerCapsCombinedOutput(t *testing.T) {
 	if !result.Truncated {
 		t.Fatal("truncated = false, want true")
 	}
+	if result.Status != CommandCompleted {
+		t.Fatalf("status = %q, want completed", result.Status)
+	}
 }
 
 func TestExecRunnerTimesOutHangingProcessGroup(t *testing.T) {
@@ -115,6 +121,9 @@ func TestExecRunnerTimesOutHangingProcessGroup(t *testing.T) {
 	}
 	if result.Output != "started" {
 		t.Fatalf("output = %q, want bounded pre-timeout output", result.Output)
+	}
+	if result.Status != CommandTimedOut {
+		t.Fatalf("status = %q, want timed_out", result.Status)
 	}
 }
 
@@ -232,6 +241,55 @@ func TestEvidenceSurfacesIdentityChangedDuringCapabilities(t *testing.T) {
 	}
 }
 
+func TestWriteEvidenceCancellationWritesNoArtifact(t *testing.T) {
+	dir := t.TempDir()
+	tool := writeTool(t, dir, "tool")
+	tests := []struct {
+		name         string
+		setup        func(context.CancelFunc, *fakeRunner) Runner
+		cancelBefore bool
+	}{
+		{
+			name:         "after executable collection boundary",
+			setup:        func(_ context.CancelFunc, runner *fakeRunner) Runner { return runner },
+			cancelBefore: true,
+		},
+		{
+			name: "after FFmpeg inspection boundary",
+			setup: func(cancel context.CancelFunc, runner *fakeRunner) Runner {
+				return runnerFunc(func(ctx context.Context, name string, args []string, limit int) CommandResult {
+					result := runner.Run(ctx, name, args, limit)
+					if strings.Contains(strings.Join(args, " "), "-formats") {
+						cancel()
+					}
+					return result
+				})
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runner := tc.setup(cancel, &fakeRunner{})
+			if tc.cancelBefore {
+				cancel()
+			}
+			path := filepath.Join(dir, strings.ReplaceAll(tc.name, " ", "-")+".json")
+			_, _, err := WriteEvidence(ctx, EvidenceOptions{
+				OutputPath: path,
+				FFmpeg:     tool, FFprobe: tool, Executable: tool, Runner: runner,
+			})
+			if err == nil || !strings.Contains(err.Error(), "context canceled") {
+				t.Fatalf("error = %v, want context canceled", err)
+			}
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("evidence artifact exists after cancellation: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestEncoderCheckSeparatesListedFromOperationalAndNeverUsesAVFoundation(t *testing.T) {
 	dir := t.TempDir()
 	tool := writeTool(t, dir, "ffmpeg")
@@ -243,8 +301,8 @@ func TestEncoderCheckSeparatesListedFromOperationalAndNeverUsesAVFoundation(t *t
 	if !isTrue(result.Listed) {
 		t.Fatal("Listed = false, want true")
 	}
-	if result.Operational {
-		t.Fatal("Operational = true, want false")
+	if !isFalse(result.Operational) {
+		t.Fatalf("Operational = %#v, want false", result.Operational)
 	}
 	for _, call := range runner.Calls() {
 		if strings.Contains(strings.ToLower(strings.Join(call, " ")), "avfoundation") {
@@ -253,6 +311,26 @@ func TestEncoderCheckSeparatesListedFromOperationalAndNeverUsesAVFoundation(t *t
 	}
 	if !reflect.DeepEqual(runner.probeArgs, EncoderProbeArgs()) {
 		t.Fatalf("probe args = %#v, want %#v", runner.probeArgs, EncoderProbeArgs())
+	}
+}
+
+func TestEncoderCheckOperationalIsUnknownWhenProbeIncomplete(t *testing.T) {
+	dir := t.TempDir()
+	tool := writeTool(t, dir, "ffmpeg")
+	for _, status := range []CommandStatus{CommandCanceled, CommandTimedOut} {
+		t.Run(string(status), func(t *testing.T) {
+			runner := &probeStatusRunner{base: &fakeRunner{}, status: status}
+			result, err := CheckEncoder(context.Background(), runner, tool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Operational != nil {
+				t.Fatalf("Operational = %#v, want unknown for %s probe", result.Operational, status)
+			}
+			if result.Probe.Status != status {
+				t.Fatalf("probe status = %q, want %q", result.Probe.Status, status)
+			}
+		})
 	}
 }
 
@@ -303,6 +381,18 @@ type mutatingRunner struct {
 	path    string
 	match   string
 	changed bool
+}
+
+type probeStatusRunner struct {
+	base   *fakeRunner
+	status CommandStatus
+}
+
+func (r *probeStatusRunner) Run(ctx context.Context, name string, args []string, limit int) CommandResult {
+	if strings.Contains(strings.Join(args, " "), "-f lavfi") {
+		return CommandResult{Status: r.status, Error: "probe did not complete"}
+	}
+	return r.base.Run(ctx, name, args, limit)
 }
 
 func (r *mutatingRunner) Run(ctx context.Context, name string, args []string, limit int) CommandResult {
@@ -372,6 +462,10 @@ func containsCall(calls [][]string, want []string) bool {
 
 func isTrue(value *bool) bool {
 	return value != nil && *value
+}
+
+func isFalse(value *bool) bool {
+	return value != nil && !*value
 }
 
 func writeTool(t *testing.T, dir, name string) string {

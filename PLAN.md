@@ -202,6 +202,9 @@ Current diagnostic limitations:
   absence is `false`; only a clean positive marker is `true`.
 - `encoder-check` uses only a generated color frame. It proves neither capture
   access nor sustained encode performance.
+- Encoder-check schema version 2 reports operational status as `null` when its
+  probe is canceled or times out, rather than conflating an incomplete probe
+  with a completed encoder failure.
 - FFmpeg diagnostic output is bounded, so unusually large listings are marked
   truncated.
 - Every diagnostic subprocess has a deadline. A timeout is preserved as a
