@@ -27,6 +27,9 @@ extension), scenecap generates a timestamped filename inside it.
 The captured FFmpeg `-devices` output is a list of compiled device backends, not
 an enumeration of attached cameras, microphones, or screens; it is the source
 for `avfoundation_listed`, while `-formats` remains general build evidence.
+Evidence schema version 2 uses `null` for compiled/listed conclusions when the
+supporting command failed or its bounded output was truncated; `false` is
+reserved for a complete, successful query that did not find the capability.
 Diagnostic subprocesses have a per-command deadline. Tool fingerprints include
 device/inode, size, modification time, mode/owner, and SHA-256 and are checked
 again around command use; a change fails the operation instead of emitting a
@@ -36,6 +39,8 @@ known-stale identity.
 FFmpeg lists it and whether a one-frame synthetic `lavfi` encode actually
 works. A listed encoder can still be non-operational, in which case the command
 prints JSON diagnostics and exits nonzero.
+Encoder-check schema version 2 applies the same `true`/`false`/`null` rule to
+the encoder listing while reporting operational probe success separately.
 
 `devices` and `record` cross the privacy boundary and may trigger macOS privacy
 prompts. Both accept `--ffmpeg`; `record` also accepts `--ffprobe`. See
@@ -51,3 +56,7 @@ Selected scenecap, FFmpeg, and FFprobe tools must be readable, nonempty regular
 files with an executable mode bit. Execute-only binaries are unsupported:
 scenecap fails with an inspection error instead of emitting an identity whose
 SHA-256 it could not verify.
+Record manifests resolve FFprobe again when recording ends, store that current
+identity and the exact probe arguments, and then validate with it. This permits
+a legitimate FFprobe symlink upgrade during a long recording while keeping the
+manifest aligned with the executable actually used.

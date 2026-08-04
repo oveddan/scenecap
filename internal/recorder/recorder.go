@@ -81,6 +81,7 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 	if err := cfg.defaults(); err != nil {
 		return Session{}, err
 	}
+	ffprobeRequested := cfg.FFprobePath
 	ffmpegIdentity, err := tooling.InspectFileIdentity(cfg.FFmpegPath)
 	if err != nil {
 		return Session{}, fmt.Errorf("required ffmpeg: %w", err)
@@ -130,6 +131,7 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 		FFprobe: commandInfo(ffprobeIdentity),
 		Output:  output,
 	}
+	session.FFprobe.Arguments = ffprobeArgs(output)
 	manifest := filepath.Join(dir, "manifest.json")
 	if err := writeManifest(manifest, session); err != nil {
 		return session, err
@@ -174,8 +176,16 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 	}
 
 	var probe Probe
-	probeErr := tooling.VerifyFileIdentity(ffprobeIdentity)
-	if probeErr == nil {
+	currentFFprobe, probeErr := tooling.InspectFileIdentity(ffprobeRequested)
+	if probeErr != nil {
+		probeErr = fmt.Errorf("resolve ffprobe for validation %q: %w", ffprobeRequested, probeErr)
+	} else {
+		cfg.FFprobePath = currentFFprobe.CanonicalPath
+		session.FFprobe = commandInfo(currentFFprobe)
+		session.FFprobe.Arguments = ffprobeArgs(output)
+		if err := writeManifest(manifest, session); err != nil {
+			return session, err
+		}
 		probe, probeErr = inspect(cfg.FFprobePath, output)
 	}
 	if probeErr != nil {
@@ -334,11 +344,7 @@ type probeDocument struct {
 }
 
 func inspect(ffprobePath, output string) (Probe, error) {
-	cmd := exec.Command(ffprobePath,
-		"-v", "error", "-read_intervals", "%+#1", "-show_frames",
-		"-show_entries", "frame=media_type:stream=codec_type,width,height:format=duration",
-		"-of", "json", output,
-	)
+	cmd := exec.Command(ffprobePath, ffprobeArgs(output)...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	data, err := cmd.Output()
@@ -380,6 +386,14 @@ func inspect(ffprobePath, output string) (Probe, error) {
 		return Probe{}, errors.New("recording contains no readable video frames")
 	}
 	return result, nil
+}
+
+func ffprobeArgs(output string) []string {
+	return []string{
+		"-v", "error", "-read_intervals", "%+#1", "-show_frames",
+		"-show_entries", "frame=media_type:stream=codec_type,width,height:format=duration",
+		"-of", "json", output,
+	}
 }
 
 type tailBuffer struct {

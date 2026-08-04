@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	EvidenceVersion = 1
+	EvidenceVersion = 2
 	outputLimit     = 32 * 1024
 	commandTimeout  = 20 * time.Second
 )
@@ -361,9 +361,9 @@ type FFmpegCapabilities struct {
 	Encoders               CommandResult `json:"encoders"`
 	HWAccels               CommandResult `json:"hwaccels"`
 	AVFoundationHelp       CommandResult `json:"avfoundation_help"`
-	AVFoundationCompiled   bool          `json:"avfoundation_compiled"`
-	AVFoundationListed     bool          `json:"avfoundation_listed"`
-	H264VideoToolboxListed bool          `json:"h264_videotoolbox_listed"`
+	AVFoundationCompiled   *bool         `json:"avfoundation_compiled"`
+	AVFoundationListed     *bool         `json:"avfoundation_listed"`
+	H264VideoToolboxListed *bool         `json:"h264_videotoolbox_listed"`
 }
 
 func WriteEvidence(ctx context.Context, opts EvidenceOptions) (string, Evidence, error) {
@@ -427,9 +427,6 @@ func WriteEvidence(ctx context.Context, opts EvidenceOptions) (string, Evidence,
 	}
 	ffmpegPath := evidence.Executables["ffmpeg"].CanonicalPath
 	ffmpegIdentity := evidence.Executables["ffmpeg"].FileIdentity()
-	if err := VerifyFileIdentity(ffmpegIdentity); err != nil {
-		return "", Evidence{}, err
-	}
 	evidence.FFmpeg = inspectFFmpeg(ctx, opts.Runner, ffmpegPath)
 	if err := VerifyFileIdentity(ffmpegIdentity); err != nil {
 		return "", Evidence{}, err
@@ -509,10 +506,28 @@ func inspectFFmpeg(ctx context.Context, runner Runner, path string) FFmpegCapabi
 		Encoders:               encoders,
 		HWAccels:               hwaccels,
 		AVFoundationHelp:       avHelp,
-		AVFoundationCompiled:   avHelp.Error == "" && strings.Contains(strings.ToLower(avHelp.Output), "avfoundation"),
-		AVFoundationListed:     componentListed(devices.Output, "avfoundation"),
-		H264VideoToolboxListed: encoderListed(encoders.Output, "h264_videotoolbox"),
+		AVFoundationCompiled:   avFoundationCompiled(avHelp),
+		AVFoundationListed:     listedConclusion(devices, "avfoundation"),
+		H264VideoToolboxListed: listedConclusion(encoders, "h264_videotoolbox"),
 	}
+}
+
+func avFoundationCompiled(result CommandResult) *bool {
+	if result.Error != "" || result.Truncated {
+		return nil
+	}
+	lower := strings.ToLower(result.Output)
+	compiled := !strings.Contains(lower, "unknown format") &&
+		strings.Contains(lower, "demuxer avfoundation [")
+	return &compiled
+}
+
+func listedConclusion(result CommandResult, name string) *bool {
+	if result.Error != "" || result.Truncated {
+		return nil
+	}
+	listed := componentListed(result.Output, name)
+	return &listed
 }
 
 func componentListed(output, name string) bool {
@@ -525,20 +540,10 @@ func componentListed(output, name string) bool {
 	return false
 }
 
-func encoderListed(output, name string) bool {
-	for _, line := range strings.Split(output, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == name {
-			return true
-		}
-	}
-	return false
-}
-
 type EncoderCheck struct {
 	Version     int                `json:"version"`
 	Executable  ExecutableIdentity `json:"ffmpeg"`
-	Listed      bool               `json:"h264_videotoolbox_listed"`
+	Listed      *bool              `json:"h264_videotoolbox_listed"`
 	Operational bool               `json:"h264_videotoolbox_operational"`
 	Listing     CommandResult      `json:"encoder_listing"`
 	Probe       CommandResult      `json:"operational_probe"`
@@ -556,9 +561,6 @@ func CheckEncoder(ctx context.Context, runner Runner, requested string) (Encoder
 		return EncoderCheck{}, err
 	}
 	expected := identity.FileIdentity()
-	if err := VerifyFileIdentity(expected); err != nil {
-		return EncoderCheck{}, err
-	}
 	listing := runner.Run(ctx, identity.CanonicalPath, []string{"-hide_banner", "-encoders"}, outputLimit)
 	if err := VerifyFileIdentity(expected); err != nil {
 		return EncoderCheck{}, err
@@ -568,9 +570,9 @@ func CheckEncoder(ctx context.Context, runner Runner, requested string) (Encoder
 		return EncoderCheck{}, err
 	}
 	return EncoderCheck{
-		Version:     1,
+		Version:     2,
 		Executable:  identity,
-		Listed:      encoderListed(listing.Output, "h264_videotoolbox"),
+		Listed:      listedConclusion(listing, "h264_videotoolbox"),
 		Operational: probe.Error == "",
 		Listing:     listing,
 		Probe:       probe,

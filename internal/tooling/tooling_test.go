@@ -36,7 +36,7 @@ func TestResolveExecutablePreservesAbsoluteAndResolvesSymlink(t *testing.T) {
 	}
 }
 
-func TestWriteEvidenceIsAtomicAndRepresentsCodesignFailures(t *testing.T) {
+func TestWriteEvidenceWritesValidJSONWithoutTempAndRepresentsCodesignFailures(t *testing.T) {
 	dir := t.TempDir()
 	tool := writeTool(t, dir, "tool")
 	runner := &fakeRunner{}
@@ -67,7 +67,7 @@ func TestWriteEvidenceIsAtomicAndRepresentsCodesignFailures(t *testing.T) {
 	if evidence.Executables["ffmpeg"].Codesign.Verification.Error == "" || stored.Executables["scenecap"].Codesign.Display.Error == "" {
 		t.Fatal("codesign failures were not represented in evidence")
 	}
-	if !evidence.FFmpeg.AVFoundationListed || !stored.FFmpeg.AVFoundationListed {
+	if !isTrue(evidence.FFmpeg.AVFoundationListed) || !isTrue(stored.FFmpeg.AVFoundationListed) {
 		t.Fatal("AVFoundation was not parsed from the FFmpeg devices listing")
 	}
 	ffmpegPath := evidence.Executables["ffmpeg"].CanonicalPath
@@ -240,7 +240,7 @@ func TestEncoderCheckSeparatesListedFromOperationalAndNeverUsesAVFoundation(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Listed {
+	if !isTrue(result.Listed) {
 		t.Fatal("Listed = false, want true")
 	}
 	if result.Operational {
@@ -256,6 +256,40 @@ func TestEncoderCheckSeparatesListedFromOperationalAndNeverUsesAVFoundation(t *t
 	}
 }
 
+func TestAVFoundationCompiledRejectsUnknownFormatOutput(t *testing.T) {
+	runner := runnerFunc(func(_ context.Context, _ string, args []string, _ int) CommandResult {
+		if strings.Contains(strings.Join(args, " "), "demuxer=avfoundation") {
+			return CommandResult{Output: "Unknown format 'avfoundation'."}
+		}
+		return CommandResult{}
+	})
+	capabilities := inspectFFmpeg(context.Background(), runner, "/fake/ffmpeg")
+	if capabilities.AVFoundationCompiled == nil || *capabilities.AVFoundationCompiled {
+		t.Fatalf("avfoundation_compiled = %#v, want false", capabilities.AVFoundationCompiled)
+	}
+}
+
+func TestDerivedCapabilityConclusionsAreUnknownForIncompleteOutput(t *testing.T) {
+	runner := runnerFunc(func(_ context.Context, _ string, args []string, _ int) CommandResult {
+		joined := strings.Join(args, " ")
+		switch {
+		case strings.Contains(joined, "-devices"):
+			return CommandResult{Output: " D  avfoundation", Truncated: true}
+		case strings.Contains(joined, "-encoders"):
+			return CommandResult{Output: " V..... h264_videotoolbox", Error: "exit status 1"}
+		case strings.Contains(joined, "demuxer=avfoundation"):
+			return CommandResult{Output: "Demuxer avfoundation [AVFoundation input device]:", Truncated: true}
+		default:
+			return CommandResult{}
+		}
+	})
+	capabilities := inspectFFmpeg(context.Background(), runner, "/fake/ffmpeg")
+	if capabilities.AVFoundationCompiled != nil || capabilities.AVFoundationListed != nil || capabilities.H264VideoToolboxListed != nil {
+		t.Fatalf("derived conclusions = compiled:%#v listed:%#v encoder:%#v, want all unknown",
+			capabilities.AVFoundationCompiled, capabilities.AVFoundationListed, capabilities.H264VideoToolboxListed)
+	}
+}
+
 type fakeRunner struct {
 	mu         sync.Mutex
 	calls      [][]string
@@ -264,6 +298,7 @@ type fakeRunner struct {
 }
 
 type mutatingRunner struct {
+	mu      sync.Mutex
 	base    *fakeRunner
 	path    string
 	match   string
@@ -272,11 +307,19 @@ type mutatingRunner struct {
 
 func (r *mutatingRunner) Run(ctx context.Context, name string, args []string, limit int) CommandResult {
 	result := r.base.Run(ctx, name, args, limit)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if !r.changed && strings.Contains(strings.Join(args, " "), r.match) {
 		r.changed = true
 		_ = os.WriteFile(r.path, []byte("#!/bin/sh\n# executable changed during inspection\nexit 0\n"), 0o755)
 	}
 	return result
+}
+
+type runnerFunc func(context.Context, string, []string, int) CommandResult
+
+func (f runnerFunc) Run(ctx context.Context, name string, args []string, limit int) CommandResult {
+	return f(ctx, name, args, limit)
 }
 
 func (r *fakeRunner) Run(_ context.Context, name string, args []string, _ int) CommandResult {
@@ -325,6 +368,10 @@ func containsCall(calls [][]string, want []string) bool {
 		}
 	}
 	return false
+}
+
+func isTrue(value *bool) bool {
+	return value != nil && *value
 }
 
 func writeTool(t *testing.T, dir, name string) string {

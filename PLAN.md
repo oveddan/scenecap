@@ -197,6 +197,9 @@ Current diagnostic limitations:
   for that demuxer; `avfoundation_listed` is parsed from FFmpeg's compiled
   device-backend listing (`-devices`). Neither
   proves device access.
+- Evidence schema version 2 represents derived compiled/listed conclusions as
+  `null` when their source command failed or was truncated. A clean complete
+  absence is `false`; only a clean positive marker is `true`.
 - `encoder-check` uses only a generated color frame. It proves neither capture
   access nor sustained encode performance.
 - FFmpeg diagnostic output is bounded, so unusually large listings are marked
@@ -210,6 +213,10 @@ Current diagnostic limitations:
 - Selected scenecap, FFmpeg, and FFprobe paths must be readable, nonempty
   regular files with an executable mode bit. Execute-only binaries are
   unsupported so evidence never records an identity with an unverifiable hash.
+- FFprobe is resolved again at validation time, and manifest v2 is updated with
+  the identity and exact arguments actually used. If it is unavailable then,
+  validation fails with the resolution diagnostic instead of silently skipping
+  the probe or rejecting a legitimate symlink upgrade as stale.
 0.5. **Final-shape hello world** — immediately encode the winning M0 runtime
    shape in the build. It prints its signing identity and invokes its selected
    ffmpeg's `-version`; every later milestone runs inside this same substrate.

@@ -63,24 +63,32 @@ func doctor(args []string) error {
 		}
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
 	fmt.Printf("platform: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 	if runtime.GOOS != "darwin" {
 		return errors.New("capture is supported only on macOS")
 	}
 
-	for _, name := range []string{*ffmpeg, *ffprobe} {
-		path, err := exec.LookPath(name)
-		if err != nil {
-			return fmt.Errorf("%s not found in PATH", name)
-		}
-		fmt.Printf("%s: %s\n", name, path)
-	}
-
-	out, err := exec.Command(*ffmpeg, "-hide_banner", "-encoders").CombinedOutput()
+	ffmpegIdentity, err := tooling.InspectFileIdentity(*ffmpeg)
 	if err != nil {
-		return fmt.Errorf("inspect FFmpeg encoders: %w", err)
+		return fmt.Errorf("inspect ffmpeg: %w", err)
 	}
-	if !strings.Contains(string(out), "h264_videotoolbox") {
+	ffprobeIdentity, err := tooling.InspectFileIdentity(*ffprobe)
+	if err != nil {
+		return fmt.Errorf("inspect ffprobe: %w", err)
+	}
+	fmt.Printf("ffmpeg: %s\n", ffmpegIdentity.CanonicalPath)
+	fmt.Printf("ffprobe: %s\n", ffprobeIdentity.CanonicalPath)
+	listing := (tooling.ExecRunner{}).Run(context.Background(), ffmpegIdentity.CanonicalPath, []string{"-hide_banner", "-encoders"}, 32*1024)
+	if listing.Error != "" {
+		return fmt.Errorf("inspect FFmpeg encoders: %s", listing.Error)
+	}
+	if listing.Truncated {
+		return errors.New("inspect FFmpeg encoders: output was truncated")
+	}
+	if !strings.Contains(listing.Output, "h264_videotoolbox") {
 		return errors.New("FFmpeg does not provide h264_videotoolbox")
 	}
 	fmt.Println("encoder: h264_videotoolbox available")
@@ -104,12 +112,12 @@ func devices(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := tooling.VerifyFileIdentity(identity); err != nil {
-		return err
-	}
 	cmd := exec.Command(identity.CanonicalPath, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if err := tooling.VerifyFileIdentity(identity); err != nil {
+		return err
+	}
 	// FFmpeg exits non-zero after listing because no output was requested.
 	err = cmd.Run()
 	var exitErr *exec.ExitError
@@ -134,7 +142,9 @@ func evidence(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	path, _, err := tooling.WriteEvidence(context.Background(), tooling.EvidenceOptions{
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	path, _, err := tooling.WriteEvidence(ctx, tooling.EvidenceOptions{
 		OutputPath: *out,
 		Case:       *caseLabel,
 		FFmpeg:     *ffmpeg,
@@ -159,7 +169,9 @@ func encoderCheck(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
 	}
-	result, err := tooling.CheckEncoder(context.Background(), tooling.ExecRunner{}, *ffmpeg)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	result, err := tooling.CheckEncoder(ctx, tooling.ExecRunner{}, *ffmpeg)
 	if err != nil {
 		return err
 	}
@@ -241,4 +253,6 @@ commands:
   evidence collect prompt-free environment and tool evidence as JSON
   encoder-check test h264_videotoolbox with a synthetic lavfi source
   record   record one screen source in the foreground
+  version  print the scenecap build version
+  help     show this help
 `

@@ -205,6 +205,64 @@ func TestRunManifestRecordsResolvedCanonicalExecutables(t *testing.T) {
 	}
 }
 
+func TestRunReinspectsChangedFFprobeSymlinkAtValidationTime(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	probeLink := filepath.Join(bin, "ffprobe")
+	probeMarker := filepath.Join(dir, "probe-v2-used")
+	t.Setenv("SCENECAP_TEST_PROBE_LINK", probeLink)
+	t.Setenv("SCENECAP_TEST_PROBE_MARKER", probeMarker)
+	ffmpeg := writeExecutable(t, bin, "ffmpeg", `#!/bin/sh
+out=""
+for arg in "$@"; do out="$arg"; done
+ln -sf real-ffprobe-v2 "$SCENECAP_TEST_PROBE_LINK"
+printf media > "$out"
+`)
+	writeExecutable(t, bin, "real-ffprobe-v1", "#!/bin/sh\nexit 91\n")
+	realV2 := writeExecutable(t, bin, "real-ffprobe-v2", `#!/bin/sh
+touch "$SCENECAP_TEST_PROBE_MARKER"
+printf '%s' '{"streams":[{"codec_type":"video","width":640,"height":480}],"format":{"duration":"1.0"},"frames":[{"media_type":"video"}]}'
+`)
+	if err := os.Symlink("real-ffprobe-v1", probeLink); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := Run(context.Background(), Config{
+		Device: "screen", FPS: 30, Bitrate: "20M", OutputRoot: filepath.Join(dir, "sessions"),
+		FFmpegPath: ffmpeg, FFprobePath: probeLink,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	wantCanonical, err := filepath.EvalSymlinks(realV2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.FFprobe.CanonicalExecutable != wantCanonical {
+		t.Fatalf("ffprobe canonical executable = %q, want upgraded %q", session.FFprobe.CanonicalExecutable, wantCanonical)
+	}
+	if !reflect.DeepEqual(session.FFprobe.Arguments, ffprobeArgs(session.Output)) {
+		t.Fatalf("ffprobe arguments = %#v, want %#v", session.FFprobe.Arguments, ffprobeArgs(session.Output))
+	}
+	if _, err := os.Stat(probeMarker); err != nil {
+		t.Fatalf("upgraded ffprobe was not used: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(session.Directory, "manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored Session
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.FFprobe.CanonicalExecutable != wantCanonical || !reflect.DeepEqual(stored.FFprobe.Arguments, ffprobeArgs(session.Output)) {
+		t.Fatalf("stored ffprobe = %#v, want upgraded identity and actual arguments", stored.FFprobe)
+	}
+}
+
 func writeExecutable(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
