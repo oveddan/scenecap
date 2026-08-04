@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/oveddan/scenecap/internal/recorder"
+	"github.com/oveddan/scenecap/internal/tooling"
 )
 
 func main() {
@@ -33,9 +35,16 @@ func run(args []string) error {
 	case "doctor":
 		return doctor(args[1:])
 	case "devices":
-		return devices()
+		return devices(args[1:])
+	case "evidence":
+		return evidence(args[1:])
+	case "encoder-check":
+		return encoderCheck(args[1:])
 	case "record":
 		return record(args[1:])
+	case "version", "--version":
+		fmt.Println("scenecap development")
+		return nil
 	case "help", "-h", "--help":
 		printUsage()
 		return nil
@@ -79,15 +88,88 @@ func doctor(args []string) error {
 	return nil
 }
 
-func devices() error {
-	cmd := exec.Command("ffmpeg", "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "")
+func devices(args []string) error {
+	fs := flag.NewFlagSet("devices", flag.ContinueOnError)
+	ffmpeg := fs.String("ffmpeg", "ffmpeg", "path to the selected ffmpeg executable")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	identity, err := tooling.InspectFileIdentity(*ffmpeg)
+	if err != nil {
+		return err
+	}
+	if err := tooling.VerifyFileIdentity(identity); err != nil {
+		return err
+	}
+	cmd := exec.Command(identity.CanonicalPath, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", "")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	// FFmpeg exits non-zero after listing because no output was requested.
-	err := cmd.Run()
+	err = cmd.Run()
 	var exitErr *exec.ExitError
 	if err != nil && !errors.As(err, &exitErr) {
 		return fmt.Errorf("list AVFoundation devices: %w", err)
+	}
+	return nil
+}
+
+func evidence(args []string) error {
+	fs := flag.NewFlagSet("evidence", flag.ContinueOnError)
+	out := fs.String("out", "", "JSON output path or directory")
+	caseLabel := fs.String("case", "", "optional experiment case label")
+	ffmpeg := fs.String("ffmpeg", "ffmpeg", "path to the selected ffmpeg executable")
+	ffprobe := fs.String("ffprobe", "ffprobe", "path to the selected ffprobe executable")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	path, _, err := tooling.WriteEvidence(context.Background(), tooling.EvidenceOptions{
+		OutputPath: *out,
+		Case:       *caseLabel,
+		FFmpeg:     *ffmpeg,
+		FFprobe:    *ffprobe,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("evidence: %s\n", path)
+	return nil
+}
+
+func encoderCheck(args []string) error {
+	fs := flag.NewFlagSet("encoder-check", flag.ContinueOnError)
+	ffmpeg := fs.String("ffmpeg", "ffmpeg", "path to the selected ffmpeg executable")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	result, err := tooling.CheckEncoder(context.Background(), tooling.ExecRunner{}, *ffmpeg)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode encoder check: %w", err)
+	}
+	fmt.Println(string(data))
+	if !result.Operational {
+		return errors.New("h264_videotoolbox is not operational; see diagnostics above")
 	}
 	return nil
 }
@@ -156,5 +238,7 @@ const usage = `usage: scenecap <command> [options]
 commands:
   doctor   check local runtime prerequisites without opening capture devices
   devices  list AVFoundation devices (may trigger macOS privacy prompts)
+  evidence collect prompt-free environment and tool evidence as JSON
+  encoder-check test h264_videotoolbox with a synthetic lavfi source
   record   record one screen source in the foreground
 `

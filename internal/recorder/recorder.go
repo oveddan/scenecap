@@ -15,9 +15,11 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/oveddan/scenecap/internal/tooling"
 )
 
-const manifestVersion = 1
+const manifestVersion = 2
 
 type Config struct {
 	Device           string
@@ -41,6 +43,7 @@ type Session struct {
 	StartedAt       time.Time   `json:"started_at"`
 	EndedAt         *time.Time  `json:"ended_at,omitempty"`
 	FFmpeg          CommandInfo `json:"ffmpeg"`
+	FFprobe         CommandInfo `json:"ffprobe"`
 	Output          string      `json:"output"`
 	ExitError       string      `json:"exit_error,omitempty"`
 	FFmpegExitError string      `json:"ffmpeg_exit_error,omitempty"`
@@ -49,8 +52,21 @@ type Session struct {
 }
 
 type CommandInfo struct {
-	Executable string   `json:"executable"`
-	Arguments  []string `json:"arguments"`
+	// Executable and Arguments are retained from manifest v1 for readers that
+	// only understand the original command record.
+	Executable          string    `json:"executable"`
+	Arguments           []string  `json:"arguments"`
+	RequestedExecutable string    `json:"requested_executable,omitempty"`
+	ResolvedExecutable  string    `json:"resolved_executable,omitempty"`
+	CanonicalExecutable string    `json:"canonical_executable,omitempty"`
+	SHA256              string    `json:"sha256,omitempty"`
+	Mode                string    `json:"mode,omitempty"`
+	OwnerUID            uint32    `json:"owner_uid"`
+	OwnerGID            uint32    `json:"owner_gid"`
+	Device              uint64    `json:"device"`
+	Inode               uint64    `json:"inode"`
+	Size                int64     `json:"size"`
+	ModifiedUTC         time.Time `json:"modified_utc"`
 }
 
 type Probe struct {
@@ -65,6 +81,16 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 	if err := cfg.defaults(); err != nil {
 		return Session{}, err
 	}
+	ffmpegIdentity, err := tooling.InspectFileIdentity(cfg.FFmpegPath)
+	if err != nil {
+		return Session{}, fmt.Errorf("required ffmpeg: %w", err)
+	}
+	ffprobeIdentity, err := tooling.InspectFileIdentity(cfg.FFprobePath)
+	if err != nil {
+		return Session{}, fmt.Errorf("required ffprobe: %w", err)
+	}
+	cfg.FFmpegPath = ffmpegIdentity.CanonicalPath
+	cfg.FFprobePath = ffprobeIdentity.CanonicalPath
 	if err := preflight(cfg); err != nil {
 		return Session{}, err
 	}
@@ -87,13 +113,33 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 		Status:    "recording",
 		StartedAt: now,
 		FFmpeg: CommandInfo{
-			Executable: cfg.FFmpegPath,
-			Arguments:  append([]string(nil), args...),
+			Executable:          cfg.FFmpegPath,
+			Arguments:           append([]string(nil), args...),
+			RequestedExecutable: ffmpegIdentity.Requested,
+			ResolvedExecutable:  ffmpegIdentity.AbsolutePath,
+			CanonicalExecutable: ffmpegIdentity.CanonicalPath,
+			SHA256:              ffmpegIdentity.SHA256,
+			Mode:                ffmpegIdentity.Mode,
+			OwnerUID:            ffmpegIdentity.OwnerUID,
+			OwnerGID:            ffmpegIdentity.OwnerGID,
+			Device:              ffmpegIdentity.Device,
+			Inode:               ffmpegIdentity.Inode,
+			Size:                ffmpegIdentity.Size,
+			ModifiedUTC:         ffmpegIdentity.ModifiedUTC,
 		},
-		Output: output,
+		FFprobe: commandInfo(ffprobeIdentity),
+		Output:  output,
 	}
 	manifest := filepath.Join(dir, "manifest.json")
 	if err := writeManifest(manifest, session); err != nil {
+		return session, err
+	}
+	if err := tooling.VerifyFileIdentity(ffmpegIdentity); err != nil {
+		session.Status = "failed"
+		session.ExitError = err.Error()
+		if manifestErr := writeManifest(manifest, session); manifestErr != nil {
+			return session, manifestErr
+		}
 		return session, err
 	}
 
@@ -127,7 +173,11 @@ func Run(ctx context.Context, cfg Config) (Session, error) {
 		return session, err
 	}
 
-	probe, probeErr := inspect(cfg.FFprobePath, output)
+	var probe Probe
+	probeErr := tooling.VerifyFileIdentity(ffprobeIdentity)
+	if probeErr == nil {
+		probe, probeErr = inspect(cfg.FFprobePath, output)
+	}
 	if probeErr != nil {
 		session.Status = "failed"
 		if session.ExitError == "" {
@@ -177,11 +227,6 @@ func (cfg *Config) defaults() error {
 }
 
 func preflight(cfg Config) error {
-	for _, executable := range []string{cfg.FFmpegPath, cfg.FFprobePath} {
-		if _, err := exec.LookPath(executable); err != nil {
-			return fmt.Errorf("required executable %q: %w", executable, err)
-		}
-	}
 	if err := os.MkdirAll(cfg.OutputRoot, 0o755); err != nil {
 		return fmt.Errorf("create output root: %w", err)
 	}
@@ -194,6 +239,23 @@ func preflight(cfg Config) error {
 		return fmt.Errorf("insufficient disk space: %d bytes free, require at least %d", free, cfg.MinimumFreeBytes)
 	}
 	return nil
+}
+
+func commandInfo(identity tooling.FileIdentity) CommandInfo {
+	return CommandInfo{
+		Executable:          identity.CanonicalPath,
+		RequestedExecutable: identity.Requested,
+		ResolvedExecutable:  identity.AbsolutePath,
+		CanonicalExecutable: identity.CanonicalPath,
+		SHA256:              identity.SHA256,
+		Mode:                identity.Mode,
+		OwnerUID:            identity.OwnerUID,
+		OwnerGID:            identity.OwnerGID,
+		Device:              identity.Device,
+		Inode:               identity.Inode,
+		Size:                identity.Size,
+		ModifiedUTC:         identity.ModifiedUTC,
+	}
 }
 
 func ffmpegArgs(cfg Config, output string) []string {

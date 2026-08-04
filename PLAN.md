@@ -152,6 +152,64 @@ about for a first Go project.
    hardened-runtime requirements, system-audio strategy, and
    `h264_videotoolbox` on this Mac. Record the macOS version and exact signing
    identity. This remains an interactive gate.
+
+### Milestone 0 human-run experiment
+
+Build once, place that unchanged binary at the path being evaluated, and use
+the same explicit FFmpeg/FFprobe paths for every row. Before opening any capture
+device, collect prompt-free evidence and test the hardware encoder:
+
+```sh
+./scenecap evidence --out ./evidence --case terminal \
+  --ffmpeg /absolute/path/to/ffmpeg --ffprobe /absolute/path/to/ffprobe
+./scenecap encoder-check --ffmpeg /absolute/path/to/ffmpeg
+```
+
+Repeat the evidence command from each launch context that already exists. Do
+not install or alter a LaunchAgent merely to run this matrix.
+
+| Case label | Existing launch context | Prompt-free evidence | Human capture action | Human observation to record |
+| --- | --- | --- | --- | --- |
+| `terminal` | Terminal, direct invocation | `evidence`, then `encoder-check` | `devices`, then a short `record` | Exact prompt wording and the System Settings entry shown |
+| `agent-host` | The agent host, direct invocation | same commands with this case label | same short screen capture, initiated by the human | Whether attribution differs from Terminal |
+| `launchd-existing` | An already-configured launchd job, if one exists | have that job invoke `evidence` | only after reviewing the evidence identity | Responsible entry and persistence after restart |
+| `stable-restart` | Same path, bytes, and launch context after restart | collect a fresh evidence file | repeat the same short capture | Whether the prior decision persists without a prompt |
+| `rebuilt-binary` | Same path and context after an intentional rebuild | collect evidence and compare hash/signing fields | repeat only when ready for a new prompt | Whether identity/attribution changed |
+
+For each applicable context, test Screen Recording, Camera, and Microphone as
+separate rows in the experiment log; macOS may attribute them differently. The
+current recorder implements only a screen source, so camera and microphone
+tests require a separate, explicitly human-run FFmpeg command until scenecap
+supports those sources. Preserve the evidence JSON next to the written notes;
+do not infer permission state from a successful codesign check or from an
+encoder result.
+
+Current diagnostic limitations:
+
+- Evidence describes executables and launch context but never reads the TCC
+  database and cannot say which process owns a grant.
+- Codesign verification, display, requirements, and entitlement failures are
+  data in the report, not evidence-collection failures and not grant status.
+- Launch-context fields intentionally contain only descriptor categories and
+  boolean environment hints; they omit environment values, arguments, user
+  names, and parent command lines.
+- `avfoundation_compiled` is a prompt-free check that FFmpeg can display help
+  for that demuxer; `avfoundation_listed` is parsed from FFmpeg's compiled
+  device-backend listing (`-devices`). Neither
+  proves device access.
+- `encoder-check` uses only a generated color frame. It proves neither capture
+  access nor sustained encode performance.
+- FFmpeg diagnostic output is bounded, so unusually large listings are marked
+  truncated.
+- Every diagnostic subprocess has a deadline. A timeout is preserved as a
+  bounded command error rather than allowing evidence collection to hang.
+- Executable fingerprints are local snapshots with last-moment revalidation,
+  not cryptographic attestation against a malicious filesystem. Device/inode,
+  metadata, and SHA-256 comparisons reduce ordinary replacement races but do
+  not remove the final pathname-to-exec interval.
+- Selected scenecap, FFmpeg, and FFprobe paths must be readable, nonempty
+  regular files with an executable mode bit. Execute-only binaries are
+  unsupported so evidence never records an identity with an unverifiable hash.
 0.5. **Final-shape hello world** — immediately encode the winning M0 runtime
    shape in the build. It prints its signing identity and invokes its selected
    ffmpeg's `-version`; every later milestone runs inside this same substrate.

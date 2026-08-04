@@ -159,6 +159,52 @@ func TestRunPreflightsExecutablesBeforeCreatingSession(t *testing.T) {
 	}
 }
 
+func TestRunManifestRecordsResolvedCanonicalExecutables(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.Mkdir(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realFFmpeg := writeExecutable(t, bin, "real-ffmpeg", "#!/bin/sh\nout=\"\"\nfor arg in \"$@\"; do out=\"$arg\"; done\nprintf media > \"$out\"\n")
+	realFFprobe := writeExecutable(t, bin, "real-ffprobe", "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"video\",\"width\":1,\"height\":1}],\"format\":{\"duration\":\"1\"},\"frames\":[{\"media_type\":\"video\"}]}'\n")
+	ffmpegLink := filepath.Join(bin, "ffmpeg")
+	ffprobeLink := filepath.Join(bin, "ffprobe")
+	if err := os.Symlink(filepath.Base(realFFmpeg), ffmpegLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(realFFprobe), ffprobeLink); err != nil {
+		t.Fatal(err)
+	}
+
+	session, err := Run(context.Background(), Config{
+		Device: "screen", FPS: 30, Bitrate: "20M", OutputRoot: filepath.Join(dir, "sessions"),
+		FFmpegPath: ffmpegLink, FFprobePath: ffprobeLink,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.Version != 2 {
+		t.Fatalf("manifest version = %d, want 2", session.Version)
+	}
+	wantFFmpeg, err := filepath.EvalSymlinks(realFFmpeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantFFprobe, err := filepath.EvalSymlinks(realFFprobe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.FFmpeg.Executable != wantFFmpeg || session.FFmpeg.CanonicalExecutable != wantFFmpeg {
+		t.Fatalf("ffmpeg identity = %#v, want canonical %q", session.FFmpeg, wantFFmpeg)
+	}
+	if session.FFmpeg.ResolvedExecutable != ffmpegLink || session.FFmpeg.RequestedExecutable != ffmpegLink {
+		t.Fatalf("ffmpeg requested/resolved identity = %#v", session.FFmpeg)
+	}
+	if session.FFprobe.CanonicalExecutable != wantFFprobe || session.FFprobe.SHA256 == "" {
+		t.Fatalf("ffprobe identity = %#v, want canonical path and hash", session.FFprobe)
+	}
+}
+
 func writeExecutable(t *testing.T, dir, name, body string) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
