@@ -334,6 +334,21 @@ func TestEncoderCheckOperationalIsUnknownWhenProbeIncomplete(t *testing.T) {
 	}
 }
 
+func TestEncoderCheckOperationalTrueForSuccessfulCompletedProbe(t *testing.T) {
+	dir := t.TempDir()
+	tool := writeTool(t, dir, "ffmpeg")
+	result, err := CheckEncoder(context.Background(), &fakeRunner{}, tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isTrue(result.Operational) {
+		t.Fatalf("Operational = %#v, want true", result.Operational)
+	}
+	if result.Probe.Status != CommandCompleted {
+		t.Fatalf("probe status = %q, want %q", result.Probe.Status, CommandCompleted)
+	}
+}
+
 func TestAVFoundationCompiledRejectsUnknownFormatOutput(t *testing.T) {
 	runner := runnerFunc(func(_ context.Context, _ string, args []string, _ int) CommandResult {
 		if strings.Contains(strings.Join(args, " "), "demuxer=avfoundation") {
@@ -435,7 +450,11 @@ func (r *fakeRunner) Run(_ context.Context, name string, args []string, _ int) C
 		return CommandResult{Output: "Demuxer avfoundation [AVFoundation input device]:"}
 	case strings.Contains(joined, "-f lavfi"):
 		r.probeArgs = append([]string(nil), args...)
-		return CommandResult{Output: "probe diagnostics", Error: r.probeError}
+		status := CommandCompleted
+		if r.probeError != "" {
+			status = CommandFailed
+		}
+		return CommandResult{Output: "probe diagnostics", Status: status, Error: r.probeError}
 	default:
 		return CommandResult{Output: "version output"}
 	}
