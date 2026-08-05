@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +97,31 @@ func TestConnectFailedAuthenticationDoesNotExposePassword(t *testing.T) {
 	}
 }
 
+func TestConnectRejectsRedirectWithoutFollowingOrLeakingPassword(t *testing.T) {
+	const password = "do-not-leak-through-redirect"
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(target.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	_, err := obsws.Connect(context.Background(), strings.TrimPrefix(redirector.URL, "http://"), password)
+	if !errors.Is(err, obsws.ErrRedirect) {
+		t.Fatalf("Connect() error = %v, want ErrRedirect", err)
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("redirect target was contacted %d times", targetHits.Load())
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Fatalf("Connect() error leaked password: %v", err)
+	}
+}
+
 func TestConnectRejectsProtocolErrorAndRequestHonorsCancellation(t *testing.T) {
 	t.Run("Hello without authentication", func(t *testing.T) {
 		server := newServer(t, func(ctx context.Context, c *websocket.Conn) {
@@ -135,6 +161,37 @@ func TestConnectRejectsProtocolErrorAndRequestHonorsCancellation(t *testing.T) {
 		_, err = c.GetVersion(ctx)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("GetVersion() error = %v, want deadline exceeded", err)
+		}
+	})
+	t.Run("pre-canceled request does not write", func(t *testing.T) {
+		noRequest := make(chan struct{}, 1)
+		server := newServer(t, func(ctx context.Context, c *websocket.Conn) {
+			write(t, ctx, c, 0, map[string]any{"rpcVersion": 1, "authentication": map[string]string{"salt": "s", "challenge": "c"}})
+			_ = read(t, ctx, c)
+			write(t, ctx, c, 2, map[string]any{"negotiatedRpcVersion": 1})
+			readCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+			defer cancel()
+			_, _, err := c.Read(readCtx)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				panic(fmt.Sprintf("unexpected request after cancellation: %v", err))
+			}
+			noRequest <- struct{}{}
+		})
+		c, err := obsws.Connect(context.Background(), serverAddr(server), "x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err = c.GetVersion(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("GetVersion() error = %v, want canceled", err)
+		}
+		select {
+		case <-noRequest:
+		case <-time.After(time.Second):
+			t.Fatal("server did not confirm no request was written")
 		}
 	})
 }

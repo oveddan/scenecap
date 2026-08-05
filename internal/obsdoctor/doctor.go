@@ -97,6 +97,23 @@ func DefaultConfigPath() (string, error) {
 	return filepath.Join(home, "Library", "Application Support", "obs-studio", "plugin_config", "obs-websocket", "config.json"), nil
 }
 
+// PasswordForConfig returns the environment password without looking up a
+// config path. Otherwise it uses configPath, or OBS's default config when no
+// explicit path was supplied.
+func PasswordForConfig(configPath string) (string, error) {
+	if password := os.Getenv("SCENECAP_OBS_PASSWORD"); password != "" {
+		return password, nil
+	}
+	if configPath == "" {
+		var err error
+		configPath, err = DefaultConfigPath()
+		if err != nil {
+			return "", err
+		}
+	}
+	return Password(configPath)
+}
+
 // Password returns the non-empty environment password when set, otherwise the
 // server_password entry from configPath. Error text never includes it.
 func Password(configPath string) (string, error) {

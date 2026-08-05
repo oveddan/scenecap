@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -27,11 +28,14 @@ const (
 	opIdentified      = 2
 	opRequest         = 6
 	opRequestResponse = 7
+
+	requestWriteTimeout = 5 * time.Second
 )
 
 var (
 	ErrNonLoopback = errors.New("OBS WebSocket address must be a loopback host")
 	ErrClosed      = errors.New("OBS WebSocket client is closed")
+	ErrRedirect    = errors.New("OBS WebSocket redirects are not allowed")
 )
 
 // RequestError is returned when OBS received a request but did not accept it.
@@ -49,7 +53,9 @@ func (e *RequestError) Error() string {
 	return fmt.Sprintf("OBS request %s failed (%d)", e.RequestType, e.Code)
 }
 
-// Client is safe for concurrent requests.
+// Client is safe for concurrent requests. Per-call contexts are checked before
+// a request is sent; the physical WebSocket write uses a bounded internal
+// deadline so one caller's cancellation cannot interrupt other requests.
 type Client struct {
 	conn *websocket.Conn
 
@@ -124,7 +130,12 @@ func Connect(ctx context.Context, address, password string) (*Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	conn, _, err := websocket.Dial(ctx, u.String(), &websocket.DialOptions{
-		HTTPClient:   &http.Client{Transport: transport},
+		HTTPClient: &http.Client{
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return ErrRedirect
+			},
+		},
 		Subprotocols: []string{"obswebsocket.json"},
 	})
 	if err != nil {
@@ -190,6 +201,9 @@ func (c *Client) request(ctx context.Context, requestType string, requestData an
 	if requestType == "" {
 		return nil, errors.New("OBS request type is required")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var data *json.RawMessage
 	if requestData != nil {
 		encoded, err := json.Marshal(requestData)
@@ -212,7 +226,13 @@ func (c *Client) request(ctx context.Context, requestType string, requestData an
 		RequestData *json.RawMessage `json:"requestData,omitempty"`
 	}{requestType, id, data}
 	c.writeMu.Lock()
-	err := writeEnvelope(ctx, c.conn, opRequest, request)
+	if err := ctx.Err(); err != nil {
+		c.writeMu.Unlock()
+		return nil, err
+	}
+	writeCtx, cancel := context.WithTimeout(context.Background(), requestWriteTimeout)
+	err := writeEnvelope(writeCtx, c.conn, opRequest, request)
+	cancel()
 	c.writeMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("send OBS request: %w", err)

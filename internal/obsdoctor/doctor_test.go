@@ -22,14 +22,14 @@ func TestPasswordFromConfigAndEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("SCENECAP_OBS_PASSWORD", "")
-	password, err := Password(path)
+	password, err := PasswordForConfig(path)
 	if err != nil || password != "from-file" {
-		t.Fatalf("Password() = %q, %v", password, err)
+		t.Fatalf("PasswordForConfig() = %q, %v", password, err)
 	}
 	t.Setenv("SCENECAP_OBS_PASSWORD", "from-env")
-	password, err = Password(filepath.Join(dir, "does-not-exist"))
+	password, err = PasswordForConfig("")
 	if err != nil || password != "from-env" {
-		t.Fatalf("Password() env = %q, %v", password, err)
+		t.Fatalf("PasswordForConfig() env = %q, %v", password, err)
 	}
 }
 

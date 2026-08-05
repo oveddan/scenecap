@@ -68,14 +68,7 @@ func obsDoctor(args []string) error {
 	if err := obsws.ValidateAddress(*address); err != nil {
 		return err
 	}
-	if *configPath == "" {
-		var err error
-		*configPath, err = obsdoctor.DefaultConfigPath()
-		if err != nil {
-			return err
-		}
-	}
-	password, err := obsdoctor.Password(*configPath)
+	password, err := obsdoctor.PasswordForConfig(*configPath)
 	if err != nil {
 		return err
 	}
