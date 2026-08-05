@@ -1,197 +1,78 @@
-# scenecap — plan
+# scenecap v1 plan
 
-## Problem
+## Direction
 
-OBS is annoying to set up for solo documentation recording (screen + webcam +
-audio, sometimes an external capture like an LED wall or a controller).
-Composited-scene tools bake layout/framing decisions in at record time. Want
-a CLI/daemon tool that:
+v1 uses OBS as the capture and permissions-owning backend, with the
+third-party Source Record filter writing one file per prepared source.
+`scenecap` will be a small local controller and session tracker; it does not
+replace OBS's compositing engine or try to reimplement macOS capture.
 
-- captures each source independently (own file, own settings, own quality)
-- lets composition (crop, zoom, arrangement, timing) happen later, in edit —
-  full native resolution preserved for that
-- is scriptable/agent-drivable (an agent can say "start recording the
-  screen" without a human touching a GUI)
-- aims to scope macOS Screen Recording / Camera / Mic permission to *this
-  tool specifically*, not to a shared shell or interpreter — an architectural
-  goal Milestone 0 must prove, not an assumed property of a Go binary
+This choice is based on a working empirical prototype:
 
-## Non-goals (v1)
+- Multiple displays capture successfully in OBS.
+- Inactive scenes render black. Prefer Studio Preview; if a Program scene must
+  be activated, save the old Program scene, make the change under a guard, and
+  restore it afterwards.
+- Native captures 2722 and 1822 pixels wide corrupted Apple VideoToolbox output
+  through stride handling. Near-native GPU scaling to aligned widths of 2688
+  and 1792 pixels respectively fixed the issue.
+- Source Record's vendor path can mutate output filenames, so controllers must
+  discover/report the final filename rather than trust a requested one.
+- Source Record is an external plugin with its own compatibility and lifecycle
+  risk.
+- TCC is owned by OBS. This intentionally removes the prior FFmpeg experiment's
+  permission-attribution question from the v1 critical path.
 
-- Live preview / compositing while recording
-- Adding/removing sources mid-recording (prepare sources, then start
-  together; stop together)
-- Streaming, virtual camera, replay buffer — none of the OBS live-production
-  features
-- Cross-platform support beyond macOS for v1 (avfoundation-specific capture
-  paths; can generalize later)
+The legacy AVFoundation/FFmpeg recorder is retained only as a provisional,
+deferred experiment. It remains covered by its existing tests but is not the
+architecture being extended for v1.
 
-## Why Go
+## Security and operating model
 
-- Subprocess orchestration (`os/exec`) and concurrency (goroutines for N
-  simultaneous ffmpeg processes) are Go's strong suit
-- Compiles to a single binary and has good macOS tooling. A stable signed
-  identity may help with permission scoping, but macOS TCC uses responsible
-  code attribution; Milestone 0 decides whether the final runtime substrate
-  can be a binary, a LaunchAgent, or must be an app bundle.
-- Mature, well-documented macOS code-signing tooling for Go binaries
+OBS stays running in the GUI (minimized is fine). Its WebSocket server must
+require authentication. The first Go transport accepts only `ws://` endpoints
+at literal loopback addresses and disables HTTP proxying. It asks for the
+`obswebsocket.json` subprotocol, completes Hello/Identify challenge auth, and
+only exposes the three read-only calls needed by `obs-doctor`.
 
-## Architecture
+The loopback restriction is a scenecap client policy, not a claim about the
+OBS server bind address. OBS may still be LAN-reachable; use a strong password,
+a host firewall, and a trusted network. Store the password in OBS, then supply
+it with `SCENECAP_OBS_PASSWORD` or OBS's local plugin JSON configuration. Never
+put a password in a CLI flag or shell argv.
 
-FFmpeg does all actual capture/encode work; scenecap is a thin Go
-orchestrator around it.
+## Current milestone: transport and compatibility preflight
 
-```
-scenecap record --source screen:device="Capture screen 0",fps=30
-scenecap record --config session.json
-scenecap pause / resume     # timeline markers; capture remains continuous
-scenecap stop               # stops all source processes
+`scenecap obs-doctor` defaults to `127.0.0.1:4455` and makes no OBS mutations.
+It reports OBS and obs-websocket versions plus the advertised / installed
+capabilities required by this backend:
 
-scenecap combine --layout <spec> -o output.mp4   # mux/encode into one video
-scenecap list                # show configured sources + recording status
-```
+- `CallVendorRequest`
+- `screen_capture`
+- `source_record_filter`
 
-### Per-source capture
+This is intentionally only a compatibility signal. It does not prove TCC,
+hardware availability, a configured capture instance, a correct Source Record
+attachment, stable filenames, or successful recording.
 
-- Each source = one `ffmpeg -f avfoundation ...` subprocess, own resolution/
-  fps/quality flags, own output file. Note: legacy AVFoundation screen
-  capture is a compatibility risk long-term — Apple is steering toward
-  ScreenCaptureKit — but fine to start with since ffmpeg's avfoundation
-  input still works today.
-- Device indices (`--device 1`) are unstable across reconnects/reboots —
-  persist device *names* and resolve to current index at record time. Add
-  a `probe`/`devices` command to enumerate what's actually available and
-  preflight each source before starting.
-- A launch timestamp is not the same as "first frame captured" — device
-  negotiation, permission prompts, and encoder startup add variable delay
-  (can be hundreds of ms). The session manifest should capture more than
-  one timestamp per source:
-  - monotonic + wall-clock launch time
-  - actual first/last media timestamp (from ffmpeg progress output or the
-    resulting file)
-  - negotiated format (actual fps/resolution, which may differ from
-    requested)
-  - ffmpeg command, version, and exit status
-- This gets you close alignment, not frame-exact hardware sync, and won't
-  by itself catch long-run drift between independent device clocks — plan
-  to validate with a clap test on a 30-60 min recording before trusting it
-  for longer sessions.
-- Shutdown must be graceful (clean ffmpeg exit, then escalate) — killing
-  ffmpeg abruptly can leave MOV/MP4 files without finalized metadata.
+## Next milestones
 
-### Pause/resume
-
-FFmpeg has no native mid-recording pause. Keep capture running and record
-session-level pause/resume markers in the manifest. The editor handoff or
-export step can remove those wall-clock intervals from every continuous
-source. This spends disk space in exchange for avoiding device reacquisition,
-format renegotiation, segment concat constraints, and per-source seam drift.
-
-### Combine step
-
-More than a single `-itsoffset` per input — `-itsoffset` only shifts input
-timestamps, it doesn't create missing media, correct drift, or define
-overlay/background behavior when a source ends before others. Expect to
-build a generated `filter_complex` (trim, setpts/asetpts, audio delay or
-silence, video freeze/filler, concat/overlay) with an explicit
-output-duration policy. Also: the concat demuxer requires matching stream
-properties across segments, so keep segment encoding settings consistent
-within a source.
-
-Reads sidecars for all sources in a session, computes per-source offsets
-from the earliest start time, and does the final encode (H.264 or HEVC,
-user-selectable quality/bitrate) into one deliverable file. Layout
-(positions/sizes/crops) supplied via a simple spec (CLI flags to start; a
-small JSON/YAML layout file once flags get unwieldy).
-
-### Permission scoping
-
-**Not settled — this is an assumption to verify, not a given.** macOS TCC
-uses "responsible code" attribution: a helper process's permission can be
-recorded against a launching/containing app rather than the process that
-literally calls the capture API. A compiled Go binary does not automatically
-get its own isolated grant just by being a static binary — that has to be
-tested empirically per launch context (Terminal, an agent host, installed
-location) and per permission type (screen, camera, mic — they can behave
-differently).
-
-Also: if TCC ends up attributing the grant to `/opt/homebrew/bin/ffmpeg`
-rather than to scenecap, that reintroduces the shared-binary problem —
-Homebrew's ffmpeg is shared by everything else on the machine that calls it.
-
-Fallback if plain compiled-binary + external ffmpeg doesn't achieve
-isolation: package scenecap as a signed `.app` bundle with a stable bundle
-identifier and `NSCameraUsageDescription`/`NSMicrophoneUsageDescription` in
-its `Info.plist`, with a long-lived supervisor process that owns capture
-(bundling ffmpeg or calling ScreenCaptureKit directly). This is the
-Milestone 0 spike below — treat it as an architectural gate, not a detail
-to confirm after the fact.
-
-Signing: ad-hoc signatures are tied to that specific build's designated
-requirement — rebuilding commonly resets the TCC prompt. Use a consistent
-signing identity (Developer ID or a stable dev cert), not plain ad-hoc.
-
-"Audio" also needs to be split: `microphone`/`audio-device` (avfoundation
-audio input) vs. `system-audio` (requires ScreenCaptureKit or a loopback
-device like BlackHole — avfoundation alone won't capture system output).
-
-## Milestones (each one runnable/demoable before moving to the next)
-
-Resequenced after Codex review: TCC attribution and the need for a
-persistent supervisor are foundational risks, not late-stage details, so
-they move up. A CLI framework (cobra/etc.) is deliberately deferred — not
-needed to learn the actual hard parts, and the stdlib is easier to reason
-about for a first Go project.
-
-0. **Environment/TCC spike** — answer the decisive question first: can a
-   scenecap-owned identity hold Screen Recording, Camera, and Mic grants that
-   Terminal does not confer? Test a stable signed binary from Terminal, the
-   same identity as a LaunchAgent, then a signed app with a bundled/re-signed
-   ffmpeg, stopping at the first reliable shape. Include launchd in the test
-   matrix; verify grants across rebuild/restart, usage-description and
-   hardened-runtime requirements, system-audio strategy, and
-   `h264_videotoolbox` on this Mac. Record the macOS version and exact signing
-   identity. This remains an interactive gate.
-0.5. **Final-shape hello world** — immediately encode the winning M0 runtime
-   shape in the build. It prints its signing identity and invokes its selected
-   ffmpeg's `-version`; every later milestone runs inside this same substrate.
-1. **Single-source foreground session** — one declarative `record` command,
-   with no mutable global config. Preflight dependencies and disk headroom,
-   create the session directory, atomically write a versioned manifest before
-   spawning ffmpeg, override `exec.CommandContext` cancellation so ffmpeg gets
-   SIGINT before forced escalation, and ffprobe the result for nonzero duration,
-   video streams, and readable frames. The initial implementation covers the
-   process, manifest, and validation core; capture remains provisional until
-   Milestone 0 is complete.
-2. **Session format hardening** — append-only event history and recovery data,
-   actual negotiated media properties, ffmpeg/macOS versions, disk space and
-   bytes written, and a `recover` command for interrupted sessions.
-3. **Supervisor + minimal CLI** — Unix-socket control, `start`/`status`/
-   `stop`. This is core architecture (something must stay alive to own the
-   ffmpeg processes across separate CLI invocations), not an optional
-   agent-control add-on — moved up from originally being the last
-   milestone.
-4. **Multi-source capture** — concurrent sources via goroutines, preflight
-   via the `probe` command, coordinated start/stop, partial-start rollback,
-   disk-space checks, then a long (30-60 min) drift test.
-5. **Alignment proof** — a diagnostic combine or a manual Premiere-import
-   workflow, validated with a clap test, before committing to a general
-   layout engine.
-6. **Editor handoff** — emit an editor-friendly timeline (FCPXML or another
-   format proven to import cleanly into Premiere) with source offsets. Native
-   combine and layout generation are post-v1 unless handoff is insufficient.
-7. **Pause/resume** — write shared logical timeline markers while continuous
-   capture keeps running; apply them during editor handoff/export.
-8. **Distribution** — notarization, installation, upgrades, and identity
-   stability. The runtime artifact shape and bundled-vs-system ffmpeg decision
-   are made immediately after Milestone 0, not deferred here.
-
-## Open questions
-
-- Layout spec format for `combine` — flags vs. a JSON/YAML file — defer
-  until Milestone 4 when the actual pain point is clear
-- Whether `combine` should live in scenecap at all vs. just being "here are
-  your synced source files + timestamps, bring your own editor" (Premiere,
-  per earlier conversation) — Milestones 1-3 don't depend on this answer
-- HEVC vs H.264 default for combine output — revisit once hardware encoder
-  access from ffmpeg on this Mac is confirmed
+1. Define a declarative source/session config and inspect existing scenes and
+   filters without mutation. Cover screen windows and camera inputs, including
+   a phone exposed to OBS as a Video Capture Device. Record the mapping from
+   configured identity to vendor-mutated output filename.
+2. Add narrow, guarded OBS mutations: prepare scenes/filters, prefer Preview,
+   and when forced to use Program activate then restore the prior scene even on
+   cancellation. No record command before this recovery behavior is tested.
+3. Start and stop all prepared Source Record sources as a coordinated session;
+   persist timestamps, OBS versions, source identities, requested and final
+   paths, and stop outcomes in a versioned manifest.
+4. Exercise multi-display, preview/program restoration, Source Record version
+   compatibility, and the near-native aligned scaling workaround across real
+   devices. Keep the unusual-width VideoToolbox finding as a compatibility
+   constraint, not a silent automatic transform.
+5. Produce editor handoff metadata and validate alignment/drift. For phone and
+   other independent camera clocks, use a visible clap or pad tap with an audio
+   transient to measure the real source offset. Composition, streaming, virtual
+   camera, source changes mid-session, and cross-platform support remain outside
+   v1.

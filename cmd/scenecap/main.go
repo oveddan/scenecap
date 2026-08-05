@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/oveddan/scenecap/internal/obsdoctor"
+	"github.com/oveddan/scenecap/internal/obsws"
 	"github.com/oveddan/scenecap/internal/recorder"
 )
 
@@ -30,6 +32,8 @@ func run(args []string) error {
 	}
 
 	switch args[0] {
+	case "obs-doctor":
+		return obsDoctor(args[1:])
 	case "doctor":
 		return doctor(args[1:])
 	case "devices":
@@ -42,6 +46,67 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+func obsDoctor(args []string) error {
+	fs := flag.NewFlagSet("obs-doctor", flag.ContinueOnError)
+	address := fs.String("address", obsdoctor.DefaultAddress, "loopback OBS WebSocket address")
+	configPath := fs.String("obs-config", "", "path to OBS WebSocket config.json (used when SCENECAP_OBS_PASSWORD is unset)")
+	timeout := fs.Duration("timeout", 5*time.Second, "connection and request timeout")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if *timeout <= 0 {
+		return errors.New("--timeout must be positive")
+	}
+	if err := obswsAddress(*address); err != nil {
+		return err
+	}
+	if *configPath == "" {
+		var err error
+		*configPath, err = obsdoctor.DefaultConfigPath()
+		if err != nil {
+			return err
+		}
+	}
+	password, err := obsdoctor.Password(*configPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	report, err := obsdoctor.Check(ctx, *address, password)
+	if err != nil {
+		return fmt.Errorf("OBS diagnostics: %w", err)
+	}
+	fmt.Printf("OBS: %s; WebSocket: %s\n", report.OBSVersion, report.WebSocketVersion)
+	fmt.Printf("CallVendorRequest: %s\n", check(report.CallVendorRequest))
+	fmt.Printf("screen_capture: %s\n", check(report.ScreenCapture))
+	fmt.Printf("source_record_filter: %s\n", check(report.SourceRecord))
+	if !report.CallVendorRequest || !report.ScreenCapture || !report.SourceRecord {
+		return errors.New("OBS is missing one or more required v1 capabilities")
+	}
+	return nil
+}
+
+func obswsAddress(address string) error {
+	if err := obsws.ValidateAddress(address); err != nil {
+		return err
+	}
+	return nil
+}
+
+func check(ok bool) string {
+	if ok {
+		return "available"
+	}
+	return "missing"
 }
 
 func doctor(args []string) error {
@@ -154,6 +219,7 @@ func printUsage() {
 const usage = `usage: scenecap <command> [options]
 
 commands:
+  obs-doctor  check the local OBS + Source Record backend (read-only)
   doctor   check local runtime prerequisites without opening capture devices
   devices  list AVFoundation devices (may trigger macOS privacy prompts)
   record   record one screen source in the foreground
