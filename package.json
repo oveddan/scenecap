@@ -1,0 +1,37 @@
+{
+  "name": "scenecap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback-only MCP sidecar for safe OBS recording control.",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test",
+    "dev": "tsx server/index.ts",
+    "lint": "eslint server tests",
+    "start": "node dist/server/index.js",
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "obs-websocket-js": "^5.0.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "eslint": "^10.8.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^4.0.17",
+    "ws": "^8.21.2"
+  }
+}

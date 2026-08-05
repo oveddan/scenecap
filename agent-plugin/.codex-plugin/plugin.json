@@ -1,0 +1,32 @@
+{
+  "name": "scenecap",
+  "version": "0.1.0",
+  "description": "Connect Codex to the local Scenecap recording MCP server.",
+  "author": {
+    "name": "Dan Oved",
+    "url": "https://github.com/oveddan"
+  },
+  "repository": "https://github.com/oveddan/scenecap",
+  "license": "MIT",
+  "keywords": [
+    "scenecap",
+    "obs",
+    "recording",
+    "macos",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Scenecap",
+    "shortDescription": "Connect to a local Scenecap recording server.",
+    "longDescription": "Connect Codex to Scenecap's local MCP server for recording workflows.",
+    "developerName": "Dan Oved",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Connect to my local Scenecap server and inspect its status."
+    ]
+  }
+}
