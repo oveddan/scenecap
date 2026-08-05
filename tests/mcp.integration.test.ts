@@ -5,8 +5,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { SidecarConfig } from "../server/config.js";
-import { McpHttpSidecar } from "../server/http.js";
+import { ConfigError, type SidecarConfig } from "../server/config.js";
+import { McpHttpSidecar, type McpHttpSidecarOptions } from "../server/http.js";
 import { createMcpServer } from "../server/mcp.js";
 import type { ObsConnectionOptions, ObsSocket } from "../server/obs.js";
 
@@ -141,7 +141,52 @@ describe("MCP HTTP sidecar", () => {
     await Promise.all([first.close(), second.close()]);
   });
 
-  it("fails rather than sharing a port with another sidecar", async () => {
+  it("expires abandoned MCP sessions after their idle TTL", async () => {
+    const sidecar = await startSidecar(
+      () => createMcpServer(configFor(0), () => new FakeObsSocket()),
+      { sessionIdleTtlMs: 10 },
+    );
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+
+    const initialized = await rawMcpRequest(port, { body: initializeRequest() });
+    const sessionId = singleHeader(initialized.headers, "mcp-session-id");
+    if (!sessionId) throw new Error("Initialize response did not include an MCP session ID.");
+
+    await delay(30);
+    await expect(
+      rawMcpRequest(port, { body: listToolsRequest(), headers: { "mcp-session-id": sessionId } }),
+    ).resolves.toMatchObject({
+      body: '{"error":{"code":-32001,"message":"Session not found"},"id":null,"jsonrpc":"2.0"}',
+      status: 404,
+    });
+  });
+
+  it("enforces its session ceiling across concurrent initializations", async () => {
+    const sidecar = await startSidecar(
+      () => createMcpServer(configFor(0), () => new FakeObsSocket()),
+      { maxSessions: 1 },
+    );
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+
+    const responses = await Promise.all(
+      Array.from({ length: 4 }, () => rawMcpRequest(port, { body: initializeRequest() })),
+    );
+    const successful = responses.filter((response) => response.status === 200);
+    expect(successful).toHaveLength(1);
+    expect(responses.filter((response) => response.status !== 200).map((response) => response.status)).toEqual([
+      400,
+      400,
+      400,
+    ]);
+    const sessionId = singleHeader(successful[0]?.headers ?? {}, "mcp-session-id");
+    if (!sessionId) throw new Error("Initialize response did not include an MCP session ID.");
+    await rawMcpRequest(port, { headers: { "mcp-session-id": sessionId }, method: "DELETE" });
+    await expect(rawMcpRequest(port, { body: initializeRequest() })).resolves.toMatchObject({ status: 200 });
+  });
+
+  it("keeps the active-instance guard after a failed peer start is stopped", async () => {
     const port = await unusedPort();
     const first = new McpHttpSidecar(configFor(port), {
       createMcpServer: () => createMcpServer(configFor(port), () => new FakeObsSocket()),
@@ -149,17 +194,69 @@ describe("MCP HTTP sidecar", () => {
     const second = new McpHttpSidecar(configFor(port), {
       createMcpServer: () => createMcpServer(configFor(port), () => new FakeObsSocket()),
     });
-    running.push(first, second);
+    const third = new McpHttpSidecar(configFor(await unusedPort()), {
+      createMcpServer: () => createMcpServer(configFor(port), () => new FakeObsSocket()),
+    });
+    running.push(first, second, third);
     await first.start();
     await expect(second.start()).rejects.toThrow(`127.0.0.1:${port}`);
+    await second.stop();
+    await expect(third.start()).rejects.toThrow(`127.0.0.1:${port}`);
   });
 
-  it("does not return an OBS error containing the configured password", async () => {
+  it("closes the listener before surfacing a session cleanup failure", async () => {
+    const sidecar = await startSidecar(() => {
+      const server = createMcpServer(configFor(0), () => new FakeObsSocket());
+      server.close = async () => {
+        throw new Error("injected close failure");
+      };
+      return server;
+    });
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+    const client = new Client({ name: "close-failure-test", version: "0.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`)));
+
+    await expect(sidecar.stop()).rejects.toThrow("injected close failure");
+    expect(sidecar.listeningPort).toBeUndefined();
+    const replacement = new McpHttpSidecar(configFor(await unusedPort()), {
+      createMcpServer: () => createMcpServer(configFor(0), () => new FakeObsSocket()),
+    });
+    running.push(replacement);
+    await expect(replacement.start()).resolves.toBeUndefined();
+    await client.close();
+  });
+
+  it("keeps MCP available when loading OBS configuration fails", async () => {
+    const sidecar = await startSidecar(() =>
+      createMcpServer(
+        { http: { host: "127.0.0.1", port: 0 } },
+        () => new FakeObsSocket(),
+        async () => {
+          throw new ConfigError("OBS setup is missing");
+        },
+      ),
+    );
+    const client = await connectClient(sidecar, "config-error-test");
+
+    const status = await getStatus(client);
+    expect(status).toEqual({
+      reason: "OBS configuration is unavailable.",
+      server: { name: "scenecap", version: "0.1.0" },
+      status: "unavailable",
+    });
+    await expect(client.listTools()).resolves.toEqual(
+      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
+    );
+    await client.close();
+  });
+
+  it("returns a curated OBS authentication failure without leaking the password", async () => {
     const secret = "integration-secret";
     const sidecar = await startSidecar(() =>
       createMcpServer(configFor(0), () => ({
         async connect() {
-          throw new Error(`OBS rejected ${secret}`);
+          throw new Error(`Authentication failed for ${secret}`);
         },
         async call() {
           throw new Error("unreachable");
@@ -167,20 +264,25 @@ describe("MCP HTTP sidecar", () => {
         disconnect() {},
       })),
     );
-    const client = new Client({ name: "scenecap-test", version: "0.0.0" });
-    await client.connect(
-      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${sidecar.listeningPort}/mcp`)),
-    );
+    const client = await connectClient(sidecar, "auth-error-test");
     const result = await client.callTool({ name: "get_status", arguments: {} });
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result)).not.toContain(secret);
+    expect(await getStatus(client)).toEqual({
+      reason: "OBS authentication failed.",
+      server: { name: "scenecap", version: "0.1.0" },
+      status: "unavailable",
+    });
     await client.close();
   });
 });
 
-async function startSidecar(factory: () => ReturnType<typeof createMcpServer>): Promise<McpHttpSidecar> {
-  const sidecar = new McpHttpSidecar(configFor(await unusedPort()), { createMcpServer: factory });
+async function startSidecar(
+  factory: () => ReturnType<typeof createMcpServer>,
+  options?: McpHttpSidecarOptions,
+): Promise<McpHttpSidecar> {
+  const sidecar = new McpHttpSidecar(configFor(await unusedPort()), { createMcpServer: factory }, options);
   running.push(sidecar);
   await sidecar.start();
   return sidecar;
@@ -201,6 +303,34 @@ async function unusedPort(): Promise<number> {
   const { port } = address;
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   return port;
+}
+
+async function connectClient(sidecar: McpHttpSidecar, name: string): Promise<Client> {
+  const client = new Client({ name, version: "0.0.0" });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${sidecar.listeningPort}/mcp`)),
+  );
+  return client;
+}
+
+async function getStatus(client: Client): Promise<unknown> {
+  const result = await client.callTool({ name: "get_status", arguments: {} }) as {
+    content?: Array<{ text?: string; type: string }>;
+  };
+  const content = result.content?.[0];
+  if (!content || content.type !== "text" || !content.text) {
+    throw new Error("Expected a text MCP tool result.");
+  }
+  return JSON.parse(content.text);
+}
+
+function singleHeader(headers: IncomingHttpHeaders, name: string): string | undefined {
+  const value = headers[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 interface RawMcpRequest {

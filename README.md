@@ -41,6 +41,13 @@ inter-process lock prevents a second sidecar on any port from becoming another
 owner. Future mutation tools will build on that boundary so separate agents
 cannot race to start or stop OBS.
 
+If the sidecar crashes, its lock is intentionally **not** removed
+automatically: automatic stale-lock recovery can race with a newly starting
+owner. First confirm that no `scenecap` sidecar process remains; then inspect
+and remove `~/.scenecap/mcp.lock` manually before restarting. An unreadable
+lock is handled the same way. The startup error distinguishes an active PID,
+a stale PID, and an unreadable lock without exposing OBS credentials.
+
 A shared Claude Code/Codex plugin package provides the connection metadata for
 this MCP server. We will create recording-driving skills only after using the
 real tools enough to identify the stable operational knowledge worth

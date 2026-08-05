@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { link, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { link, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -36,19 +36,13 @@ export class ProcessSingleton {
   async acquire(): Promise<void> {
     if (this.#acquired) return;
     await mkdir(dirname(this.#lockPath), { recursive: true, mode: 0o700 });
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        await this.#publishOwnerRecord();
-        this.#acquired = true;
-        return;
-      } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
-        if (!(await this.#recoverStaleOwner())) {
-          throw new Error("Another scenecap MCP sidecar is already running.", { cause: error });
-        }
-      }
+    try {
+      await this.#publishOwnerRecord();
+      this.#acquired = true;
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error;
+      throw await this.#existingLockError(error);
     }
-    throw new Error("Another scenecap MCP sidecar is already running.");
   }
 
   async release(): Promise<void> {
@@ -60,17 +54,21 @@ export class ProcessSingleton {
     }
   }
 
-  async #recoverStaleOwner(): Promise<boolean> {
+  async #existingLockError(cause: unknown): Promise<Error> {
     const owner = await readLockRecord(this.#lockPath);
-    if (owner && this.#isProcessAlive(owner.pid)) return false;
-    const stalePath = `${this.#lockPath}.stale-${this.#token}`;
-    try {
-      await rename(this.#lockPath, stalePath);
-      await unlink(stalePath).catch(() => undefined);
-      return true;
-    } catch {
-      return false;
+    if (!owner) {
+      return new Error(
+        `Scenecap MCP lock is unreadable. Inspect and remove it manually after confirming no sidecar is running: ${this.#lockPath}`,
+        { cause },
+      );
     }
+    if (this.#isProcessAlive(owner.pid)) {
+      return new Error(`Another scenecap MCP sidecar is already running (PID ${owner.pid}).`, { cause });
+    }
+    return new Error(
+      `A stale scenecap MCP lock was found (PID ${owner.pid}). Inspect and remove it manually after confirming no sidecar is running: ${this.#lockPath}`,
+      { cause },
+    );
   }
 
   async #publishOwnerRecord(): Promise<void> {

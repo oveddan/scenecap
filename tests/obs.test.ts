@@ -90,6 +90,19 @@ describe("readObsStatus", () => {
     await expect(pending).rejects.toMatchObject({ kind: "cancelled" });
     expect(socket.disconnected).toBe(true);
   });
+
+  it("applies one timeout budget to the complete preflight", async () => {
+    const socket = new SlowSocket(15);
+
+    await expect(
+      readObsStatus(
+        { host: "127.0.0.1", password: "test-secret", port: 4455 },
+        () => socket,
+        { timeoutMs: 35 },
+      ),
+    ).rejects.toMatchObject({ kind: "timeout" });
+    expect(socket.disconnected).toBe(true);
+  });
 });
 
 class HangingConnectSocket implements ObsSocket {
@@ -129,4 +142,29 @@ class HangingRequestSocket implements ObsSocket {
   waitForRequest(): Promise<void> {
     return this.#requestStartedPromise;
   }
+}
+
+class SlowSocket implements ObsSocket {
+  disconnected = false;
+
+  constructor(readonly delayMs: number) {}
+
+  async connect(): Promise<void> {
+    await delay(this.delayMs);
+  }
+
+  async call(requestType: "GetVersion" | "GetInputKindList" | "GetSourceFilterKindList"): Promise<unknown> {
+    await delay(this.delayMs);
+    if (requestType === "GetVersion") return {};
+    if (requestType === "GetInputKindList") return { inputKinds: [] };
+    return { sourceFilterKinds: [] };
+  }
+
+  disconnect(): void {
+    this.disconnected = true;
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

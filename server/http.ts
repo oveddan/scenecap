@@ -13,16 +13,25 @@ export interface McpHttpSidecarDependencies {
   createMcpServer: () => McpServer;
 }
 
+export interface McpHttpSidecarOptions {
+  maxSessions?: number;
+  sessionIdleTtlMs?: number;
+}
+
 interface Session {
   server: McpServer;
   transport: StreamableHTTPServerTransport;
   sessionId?: string;
+  idleTimer?: NodeJS.Timeout;
   connected: boolean;
   disposing: boolean;
   disposePromise?: Promise<void>;
 }
 
-let activeSidecarPort: number | undefined;
+const DEFAULT_MAX_SESSIONS = 16;
+const DEFAULT_SESSION_IDLE_TTL_MS = 5 * 60_000;
+
+let activeSidecar: { owner: McpHttpSidecar; port: number } | undefined;
 
 /**
  * A local-only Streamable HTTP server. It has no proxy support and binds to
@@ -33,20 +42,32 @@ export class McpHttpSidecar {
   readonly #config: SidecarConfig;
   readonly #dependencies: McpHttpSidecarDependencies;
   readonly #sessions = new Map<string, Session>();
+  readonly #maxSessions: number;
+  readonly #sessionIdleTtlMs: number;
   #httpServer?: NodeHttpServer;
 
-  constructor(config: SidecarConfig, dependencies: McpHttpSidecarDependencies) {
+  constructor(
+    config: SidecarConfig,
+    dependencies: McpHttpSidecarDependencies,
+    options: McpHttpSidecarOptions = {},
+  ) {
     this.#config = config;
     this.#dependencies = dependencies;
+    this.#maxSessions = positiveInteger(options.maxSessions, DEFAULT_MAX_SESSIONS, "maxSessions");
+    this.#sessionIdleTtlMs = positiveInteger(
+      options.sessionIdleTtlMs,
+      DEFAULT_SESSION_IDLE_TTL_MS,
+      "sessionIdleTtlMs",
+    );
   }
 
   async start(): Promise<void> {
     if (this.#httpServer?.listening) {
       throw new Error("MCP sidecar is already running.");
     }
-    if (activeSidecarPort !== undefined) {
+    if (activeSidecar !== undefined) {
       throw new Error(
-        `MCP sidecar is already running on ${LOOPBACK_HOST}:${activeSidecarPort}.`,
+        `MCP sidecar is already running on ${LOOPBACK_HOST}:${activeSidecar.port}.`,
       );
     }
 
@@ -62,30 +83,41 @@ export class McpHttpSidecar {
 
     const server = createServer(app);
     this.#httpServer = server;
-    activeSidecarPort = this.#config.http.port;
+    activeSidecar = { owner: this, port: this.#config.http.port };
     try {
       await listen(server, this.#config.http.port);
     } catch (error) {
-      if (activeSidecarPort === this.#config.http.port) activeSidecarPort = undefined;
+      if (activeSidecar?.owner === this) activeSidecar = undefined;
       this.#httpServer = undefined;
       throw error;
     }
   }
 
   async stop(): Promise<void> {
-    await Promise.all([...this.#sessions.values()].map((session) => this.#disposeSession(session)));
+    const sessionResults = await Promise.allSettled(
+      [...this.#sessions.values()].map((session) => this.#disposeSession(session)),
+    );
     this.#sessions.clear();
 
-    if (activeSidecarPort === this.#config.http.port) activeSidecarPort = undefined;
-    if (!this.#httpServer?.listening) {
+    const server = this.#httpServer;
+    let listenerError: unknown;
+    try {
+      if (server?.listening) {
+        server.closeAllConnections();
+        await closeServer(server);
+      }
+    } catch (error) {
+      listenerError = error;
+    } finally {
       this.#httpServer = undefined;
-      return;
+      if (activeSidecar?.owner === this) activeSidecar = undefined;
     }
-    this.#httpServer.closeAllConnections();
-    await new Promise<void>((resolve, reject) => {
-      this.#httpServer?.close((error) => (error ? reject(error) : resolve()));
-    });
-    this.#httpServer = undefined;
+
+    const sessionError = sessionResults.find(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    )?.reason;
+    if (listenerError) throw listenerError;
+    if (sessionError) throw sessionError;
   }
 
   get listeningPort(): number | undefined {
@@ -97,6 +129,7 @@ export class McpHttpSidecar {
     const sessionId = req.header("mcp-session-id");
     const existing = sessionId ? this.#sessions.get(sessionId) : undefined;
     if (existing) {
+      this.#touchSession(existing);
       await existing.transport.handleRequest(req, res, req.body);
       return;
     }
@@ -116,8 +149,12 @@ export class McpHttpSidecar {
     const transport = new StreamableHTTPServerTransport({
       enableJsonResponse: true,
       onsessioninitialized: (initializedSessionId) => {
+        if (this.#sessions.size >= this.#maxSessions) {
+          throw new Error("MCP session capacity reached.");
+        }
         session.sessionId = initializedSessionId;
         this.#sessions.set(initializedSessionId, session);
+        this.#touchSession(session);
       },
       onsessionclosed: (closedSessionId) => {
         this.#forgetSession(session, closedSessionId);
@@ -145,10 +182,29 @@ export class McpHttpSidecar {
   };
 
   #forgetSession(session: Session, sessionId = session.sessionId): void {
+    this.#clearSessionTimer(session);
     if (sessionId && this.#sessions.get(sessionId) === session) {
       this.#sessions.delete(sessionId);
     }
     session.sessionId = undefined;
+  }
+
+  #touchSession(session: Session): void {
+    if (!session.sessionId || session.disposing) return;
+
+    this.#clearSessionTimer(session);
+    const sessionId = session.sessionId;
+    session.idleTimer = setTimeout(() => {
+      if (this.#sessions.get(sessionId) === session) {
+        void this.#disposeSession(session).catch(() => undefined);
+      }
+    }, this.#sessionIdleTtlMs);
+    session.idleTimer.unref();
+  }
+
+  #clearSessionTimer(session: Session): void {
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    session.idleTimer = undefined;
   }
 
   async #disposeSession(session: Session): Promise<void> {
@@ -157,7 +213,10 @@ export class McpHttpSidecar {
     session.disposing = true;
     this.#forgetSession(session);
     session.disposePromise = session.connected
-      ? session.server.close()
+      ? session.server.close().catch(async (error: unknown) => {
+          await session.transport.close();
+          throw error;
+        })
       : Promise.all([session.server.close(), session.transport.close()]).then(() => undefined);
     return session.disposePromise;
   }
@@ -171,7 +230,7 @@ export class McpHttpSidecar {
     queueMicrotask(() => {
       if (session.disposing || session.disposePromise) return;
       session.disposing = true;
-      session.disposePromise = session.server.close();
+      session.disposePromise = session.server.close().catch(() => undefined);
     });
   }
 }
@@ -195,6 +254,20 @@ function rejectProxyAndOffHostRequests(req: Request, res: Response, next: NextFu
 
 function sendJsonRpcError(res: Response, status: number, code: number, message: string): void {
   res.status(status).json({ error: { code, message }, id: null, jsonrpc: "2.0" });
+}
+
+function positiveInteger(value: number | undefined, fallback: number, name: string): number {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved < 1) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return resolved;
+}
+
+function closeServer(server: NodeHttpServer): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
 }
 
 function listen(server: NodeHttpServer, port: number): Promise<void> {

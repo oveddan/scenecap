@@ -36,6 +36,13 @@ per-user inter-process lock now establishes that owner independently of the
 chosen HTTP port. That owner will also hold snapshots of temporary OBS state
 and the information needed to restore it after a session.
 
+Crash recovery for the process lock is deliberately fail-closed. A stale or
+unreadable `~/.scenecap/mcp.lock` is never automatically removed because a
+reader could otherwise delete a newly published owner (an ABA race). After a
+crash, confirm no sidecar process remains, then inspect and remove that lock
+manually. Startup errors identify active, stale, and unreadable locks without
+revealing OBS credentials.
+
 ### Security model
 
 - The sidecar and OBS WebSocket listen on loopback only. Do not expose them to

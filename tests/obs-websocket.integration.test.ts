@@ -5,7 +5,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 
-import { readObsStatus } from "../server/obs.js";
+import { classifyObsFailure, readObsStatus } from "../server/obs.js";
 
 const servers: Array<{ close(): Promise<void> }> = [];
 
@@ -85,6 +85,26 @@ describe("ObsWebSocketAdapter", () => {
     expect(String(failure)).not.toContain(password);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(redirectTargetConnections).toBe(0);
+  });
+
+  it("classifies OBS's protocol-defined authentication close code", async () => {
+    const fakeObs = await startObsServer((socket) => {
+      socket.send(message(0, {
+        authentication: { challenge: "test-challenge", salt: "test-salt" },
+        obsWebSocketVersion: "5.5.0",
+        rpcVersion: 1,
+      }));
+      socket.once("message", () => socket.close(4009, "Authentication Failed"));
+    });
+
+    const failure = await readObsStatus({
+      host: "127.0.0.1",
+      password: "wrong-password",
+      port: fakeObs.port,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toMatchObject({ code: 4009 });
+    expect(classifyObsFailure(failure)).toBe("authentication_failed");
   });
 });
 

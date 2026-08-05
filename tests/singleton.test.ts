@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 describe("ProcessSingleton", () => {
-  it("recovers a stale lock and never removes a lock owned by another token", async () => {
+  it("fails closed for a stale lock and never removes it", async () => {
     const lockPath = await temporaryLockPath();
     await writeFile(lockPath, JSON.stringify({ pid: 999_999, token: "stale" }));
     const singleton = new ProcessSingleton({
@@ -25,11 +25,26 @@ describe("ProcessSingleton", () => {
       token: "current-owner",
     });
 
-    await singleton.acquire();
-    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual({ pid: 123, token: "current-owner" });
-    await writeFile(lockPath, JSON.stringify({ pid: 456, token: "different-owner" }));
-    await singleton.release();
-    expect(await readFile(lockPath, "utf8")).toContain("different-owner");
+    await expect(singleton.acquire()).rejects.toThrow("stale scenecap MCP lock");
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual({ pid: 999_999, token: "stale" });
+  });
+
+  it("fails closed for an unreadable lock", async () => {
+    const lockPath = await temporaryLockPath();
+    await writeFile(lockPath, "not JSON");
+    const singleton = new ProcessSingleton({ isProcessAlive: () => false, lockPath });
+
+    await expect(singleton.acquire()).rejects.toThrow("lock is unreadable");
+    await expect(readFile(lockPath, "utf8")).resolves.toBe("not JSON");
+  });
+
+  it("reports an active owner PID without changing its lock", async () => {
+    const lockPath = await temporaryLockPath();
+    await writeFile(lockPath, JSON.stringify({ pid: 456, token: "active" }));
+    const singleton = new ProcessSingleton({ isProcessAlive: () => true, lockPath });
+
+    await expect(singleton.acquire()).rejects.toThrow("already running (PID 456)");
+    expect(JSON.parse(await readFile(lockPath, "utf8"))).toEqual({ pid: 456, token: "active" });
   });
 
   it("atomically publishes only one fully initialized owner record", async () => {

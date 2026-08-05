@@ -16,10 +16,10 @@ describe("get_status failure reporting", () => {
     [new ObsStatusError("timeout"), "OBS preflight timed out."],
     [new ObsStatusError("cancelled"), "OBS preflight was cancelled."],
     [new Error("authentication failed for a secret"), "OBS authentication failed."],
-    [Object.assign(new Error("closed"), { code: 4005 }), "OBS authentication failed."],
+    [Object.assign(new Error("closed"), { code: 4009 }), "OBS authentication failed."],
     [new Error("connect ECONNREFUSED"), "OBS is unavailable or refused the connection."],
     [new Error("invalid subprotocol"), "OBS WebSocket protocol is incompatible."],
-    [Object.assign(new Error("closed"), { code: 4009 }), "OBS WebSocket protocol is incompatible."],
+    [Object.assign(new Error("closed"), { code: 4010 }), "OBS WebSocket protocol is incompatible."],
     [new Error("secret-other-error"), "OBS preflight failed for an unknown reason."],
   ])("returns a curated non-secret failure reason", (error, expected) => {
     const reason = curatedFailureReason(error);
