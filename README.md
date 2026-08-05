@@ -35,9 +35,11 @@ scenecap TypeScript sidecar (singleton, localhost only)
 OBS: sources, permissions, capture, encoding, files
 ```
 
-The sidecar is a single local owner of recording-session state. It prevents
-separate chat sessions from racing to start or stop the same OBS recording and
-can retain the context needed to restore temporary OBS changes safely.
+The sidecar is the single local owner of recording-session state. The fixed
+port prevents two HTTP listeners from starting, while an atomic per-user
+inter-process lock prevents a second sidecar on any port from becoming another
+owner. Future mutation tools will build on that boundary so separate agents
+cannot race to start or stop OBS.
 
 A shared Claude Code/Codex plugin package provides the connection metadata for
 this MCP server. We will create recording-driving skills only after using the
@@ -57,11 +59,18 @@ pnpm run build
 pnpm start
 ```
 
-The built sidecar listens only at
-`http://127.0.0.1:3233/mcp`. Keep it running, then use the bundle in
-[`agent-plugin/`](agent-plugin/) to connect Claude Code or Codex to that
-endpoint. The plugin connects to the sidecar; it does not launch the server.
-This repository does not yet prescribe a marketplace installation command.
+The built sidecar listens only at `http://127.0.0.1:3233/mcp`. Keep it running,
+then connect a local client directly:
+
+```sh
+claude mcp add --transport http scenecap http://127.0.0.1:3233/mcp
+codex mcp add scenecap --url http://127.0.0.1:3233/mcp
+```
+
+These are local MCP connection commands, not marketplace installation
+commands. The shared development bundle lives in [`agent-plugin/`](agent-plugin/)
+and points both hosts at the same endpoint. It connects to the sidecar; it does
+not launch it.
 
 ### Configuration
 
@@ -76,6 +85,9 @@ The sidecar always binds to `127.0.0.1`. It reads configuration in this order:
   That file must provide a non-empty password; its host, if present, must be
   exactly `127.0.0.1`. `SCENECAP_OBS_PORT` overrides its configured port.
 - Set `SCENECAP_PORT` to change the MCP HTTP port from its default of `3233`.
+  Because [`agent-plugin/.mcp.json`](agent-plugin/.mcp.json) contains the
+  literal default endpoint, a custom port also requires updating that file (or
+  configuring the client directly with the matching URL).
 
 All configured ports must be numeric values from 1 through 65535.
 
@@ -84,8 +96,22 @@ For development validation, run:
 ```sh
 pnpm run check
 pnpm run build
-python3 /Users/danoved/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py agent-plugin
 ```
+
+`pnpm run check` lints and type-checks the TypeScript/config surface, runs the
+server tests, and verifies that both plugin manifests and `.mcp.json` remain in
+sync. The retained Go/FFmpeg tree is frozen, unverified legacy and is
+intentionally excluded from this default check.
+
+For a live smoke test, leave OBS and `pnpm start` running in one terminal, then
+use the repository's installed MCP SDK client from another:
+
+```sh
+pnpm run smoke
+```
+
+The command connects over Streamable HTTP, lists tools, calls `get_status`, and
+prints both responses. It does not mutate OBS.
 
 Skills remain deliberately deferred until real sessions using these tools
 establish a stable workflow worth packaging.

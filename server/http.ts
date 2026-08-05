@@ -16,6 +16,10 @@ export interface McpHttpSidecarDependencies {
 interface Session {
   server: McpServer;
   transport: StreamableHTTPServerTransport;
+  sessionId?: string;
+  connected: boolean;
+  disposing: boolean;
+  disposePromise?: Promise<void>;
 }
 
 let activeSidecarPort: number | undefined;
@@ -69,7 +73,7 @@ export class McpHttpSidecar {
   }
 
   async stop(): Promise<void> {
-    await Promise.all([...this.#sessions.values()].map(({ transport }) => transport.close()));
+    await Promise.all([...this.#sessions.values()].map((session) => this.#disposeSession(session)));
     this.#sessions.clear();
 
     if (activeSidecarPort === this.#config.http.port) activeSidecarPort = undefined;
@@ -77,6 +81,7 @@ export class McpHttpSidecar {
       this.#httpServer = undefined;
       return;
     }
+    this.#httpServer.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       this.#httpServer?.close((error) => (error ? reject(error) : resolve()));
     });
@@ -96,34 +101,79 @@ export class McpHttpSidecar {
       return;
     }
 
-    if (sessionId || !isInitializeRequest(req.body)) {
-      res.status(400).json({
-        error: { code: -32000, message: "Invalid MCP session." },
-        id: null,
-        jsonrpc: "2.0",
-      });
+    if (sessionId) {
+      sendJsonRpcError(res, 404, -32001, "Session not found");
       return;
     }
 
+    if (!isInitializeRequest(req.body)) {
+      sendJsonRpcError(res, 400, -32000, "Bad Request: Mcp-Session-Id header is required");
+      return;
+    }
+
+    const server = this.#dependencies.createMcpServer();
+    const session = { connected: false, disposing: false, server } as Session;
     const transport = new StreamableHTTPServerTransport({
       enableJsonResponse: true,
+      onsessioninitialized: (initializedSessionId) => {
+        session.sessionId = initializedSessionId;
+        this.#sessions.set(initializedSessionId, session);
+      },
       onsessionclosed: (closedSessionId) => {
-        this.#sessions.delete(closedSessionId);
+        this.#forgetSession(session, closedSessionId);
       },
       sessionIdGenerator: randomUUID,
     });
-    const server = this.#dependencies.createMcpServer();
+    session.transport = transport;
     transport.onclose = () => {
-      if (transport.sessionId) {
-        this.#sessions.delete(transport.sessionId);
-      }
+      this.#forgetSession(session);
+      this.#closeServerAfterTransportClosed(session);
     };
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-    if (transport.sessionId) {
-      this.#sessions.set(transport.sessionId, { server, transport });
+
+    try {
+      await server.connect(transport);
+      session.connected = true;
+      await transport.handleRequest(req, res, req.body);
+
+      // A syntactically initialize-shaped request can still fail before the
+      // transport establishes a session. Do not retain its server or transport.
+      if (!session.sessionId) await this.#disposeSession(session);
+    } catch (error) {
+      await this.#disposeSession(session);
+      throw error;
     }
   };
+
+  #forgetSession(session: Session, sessionId = session.sessionId): void {
+    if (sessionId && this.#sessions.get(sessionId) === session) {
+      this.#sessions.delete(sessionId);
+    }
+    session.sessionId = undefined;
+  }
+
+  async #disposeSession(session: Session): Promise<void> {
+    if (session.disposePromise) return session.disposePromise;
+
+    session.disposing = true;
+    this.#forgetSession(session);
+    session.disposePromise = session.connected
+      ? session.server.close()
+      : Promise.all([session.server.close(), session.transport.close()]).then(() => undefined);
+    return session.disposePromise;
+  }
+
+  #closeServerAfterTransportClosed(session: Session): void {
+    if (session.disposing || session.disposePromise) return;
+
+    // McpServer's close() delegates to its transport. Schedule this after the
+    // transport's close callback chain so its Protocol has released that
+    // transport; otherwise a client DELETE would close it twice.
+    queueMicrotask(() => {
+      if (session.disposing || session.disposePromise) return;
+      session.disposing = true;
+      session.disposePromise = session.server.close();
+    });
+  }
 }
 
 function rejectProxyAndOffHostRequests(req: Request, res: Response, next: NextFunction): void {
@@ -134,7 +184,17 @@ function rejectProxyAndOffHostRequests(req: Request, res: Response, next: NextFu
     res.status(400).json({ error: "Loopback requests cannot be proxied." });
     return;
   }
+  // Local MCP agents omit Origin. Do not add CORS here without reconsidering
+  // the browser threat model and authentication boundary.
+  if (req.headers.origin !== undefined) {
+    res.status(403).json({ error: "Browser origins are not permitted." });
+    return;
+  }
   next();
+}
+
+function sendJsonRpcError(res: Response, status: number, code: number, message: string): void {
+  res.status(status).json({ error: { code, message }, id: null, jsonrpc: "2.0" });
 }
 
 function listen(server: NodeHttpServer, port: number): Promise<void> {

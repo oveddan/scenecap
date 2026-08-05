@@ -19,11 +19,14 @@ export interface SidecarConfig {
     host: typeof LOOPBACK_HOST;
     port: number;
   };
-  obs: {
-    host: typeof LOOPBACK_HOST;
-    port: number;
-    password: string;
-  };
+  /** Present only for callers that explicitly load OBS configuration. */
+  obs?: ObsConfig;
+}
+
+export interface ObsConfig {
+  host: typeof LOOPBACK_HOST;
+  port: number;
+  password: string;
 }
 
 interface ObsConfigFile {
@@ -55,14 +58,27 @@ export class ConfigError extends Error {
  */
 export async function loadConfig(
   dependencies: ConfigDependencies = {},
-): Promise<SidecarConfig> {
+): Promise<SidecarConfig & { obs: ObsConfig }> {
+  return {
+    ...loadServerConfig(dependencies),
+    obs: await loadObsConfig(dependencies),
+  };
+}
+
+/** Load only sidecar settings that are safe and required at process start. */
+export function loadServerConfig(dependencies: ConfigDependencies = {}): SidecarConfig {
+  const env = dependencies.env ?? process.env;
+  return { http: { host: LOOPBACK_HOST, port: parsePort(env.SCENECAP_PORT, DEFAULT_MCP_PORT, "SCENECAP_PORT") } };
+}
+
+/** Load OBS credentials lazily, so missing OBS setup never prevents MCP startup. */
+export async function loadObsConfig(dependencies: ConfigDependencies = {}): Promise<ObsConfig> {
   const env = dependencies.env ?? process.env;
   const password = env.SCENECAP_OBS_PASSWORD ?? env.OBS_WEBSOCKET_PASSWORD;
-  const httpPort = parsePort(env.SCENECAP_PORT, DEFAULT_MCP_PORT, "SCENECAP_PORT");
   const envObsPort = parsePort(env.SCENECAP_OBS_PORT, DEFAULT_OBS_PORT, "SCENECAP_OBS_PORT");
-
+  const hasEnvObsPort = env.SCENECAP_OBS_PORT !== undefined && env.SCENECAP_OBS_PORT !== "";
   if (isNonEmptyString(password)) {
-    return withObsPassword(httpPort, password, envObsPort);
+    return withObsPassword(password, envObsPort);
   }
 
   const configPath =
@@ -88,21 +104,11 @@ export async function loadConfig(
     throw new ConfigError("OBS WebSocket password is required.");
   }
 
-  return {
-    http: { host: LOOPBACK_HOST, port: httpPort },
-    obs: {
-      host,
-      port: env.SCENECAP_OBS_PORT === undefined ? configObsPort : envObsPort,
-      password: filePassword,
-    },
-  };
+  return { host, port: hasEnvObsPort ? envObsPort : configObsPort, password: filePassword };
 }
 
-function withObsPassword(httpPort: number, password: string, obsPort: number): SidecarConfig {
-  return {
-    http: { host: LOOPBACK_HOST, port: httpPort },
-    obs: { host: LOOPBACK_HOST, port: obsPort, password },
-  };
+function withObsPassword(password: string, obsPort: number): ObsConfig {
+  return { host: LOOPBACK_HOST, port: obsPort, password };
 }
 
 function parseConfigFile(contents: string): ObsConfigFile {

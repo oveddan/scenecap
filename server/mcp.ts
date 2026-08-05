@@ -1,14 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import type { ObsSocketFactory } from "./obs.js";
-import { readObsStatus } from "./obs.js";
-import type { SidecarConfig } from "./config.js";
+import { ConfigError, loadObsConfig, type ObsConfig, type SidecarConfig } from "./config.js";
+import { classifyObsFailure, readObsStatus, type ObsSocketFactory } from "./obs.js";
 
 export const SERVER_INFO = { name: "scenecap", version: "0.1.0" } as const;
 
 export function createMcpServer(
   config: SidecarConfig,
   createSocket?: ObsSocketFactory,
+  loadObs: () => Promise<ObsConfig> = config.obs ? async () => config.obs as ObsConfig : loadObsConfig,
 ): McpServer {
   const server = new McpServer(SERVER_INFO);
 
@@ -24,7 +24,7 @@ export function createMcpServer(
     },
     async (extra) => {
       try {
-        const status = await readObsStatus(config.obs, createSocket, extra.signal);
+        const status = await readObsStatus(await loadObs(), createSocket, { signal: extra.signal });
         return {
           content: [
             {
@@ -33,7 +33,7 @@ export function createMcpServer(
             },
           ],
         };
-      } catch {
+      } catch (error) {
         // OBS errors may include implementation-specific details. Do not return
         // or log them: a password supplied by a third party must never escape.
         return {
@@ -43,7 +43,7 @@ export function createMcpServer(
               text: JSON.stringify({
                 server: SERVER_INFO,
                 status: "unavailable",
-                reason: "OBS preflight failed.",
+                reason: curatedFailureReason(error),
               }),
             },
           ],
@@ -54,4 +54,22 @@ export function createMcpServer(
   );
 
   return server;
+}
+
+export function curatedFailureReason(error: unknown): string {
+  if (error instanceof ConfigError) return "OBS configuration is unavailable.";
+  switch (classifyObsFailure(error)) {
+    case "authentication_failed":
+      return "OBS authentication failed.";
+    case "cancelled":
+      return "OBS preflight was cancelled.";
+    case "incompatible_protocol":
+      return "OBS WebSocket protocol is incompatible.";
+    case "obs_unavailable":
+      return "OBS is unavailable or refused the connection.";
+    case "timeout":
+      return "OBS preflight timed out.";
+    case "unknown":
+      return "OBS preflight failed for an unknown reason.";
+  }
 }

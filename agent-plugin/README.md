@@ -20,7 +20,23 @@ http://127.0.0.1:3233/mcp
 
 The server is deliberately loopback-only. Run the Scenecap server locally
 before using this package; the plugin neither launches it nor exposes it on the
-network.
+network. If the server uses a custom `SCENECAP_PORT`, update `.mcp.json` to the
+same port or configure the MCP client directly with that matching URL.
+
+For local development, start the server from the repository root and connect
+either client directly:
+
+```sh
+pnpm run build
+pnpm start
+claude mcp add --transport http scenecap http://127.0.0.1:3233/mcp
+codex mcp add scenecap --url http://127.0.0.1:3233/mcp
+```
+
+The last two commands configure a local MCP connection; they are not
+marketplace installation commands. Run only the command for the client being
+tested. The checked-in bundle remains the shared source for eventual plugin
+distribution.
 
 ## Development
 
@@ -32,5 +48,11 @@ behavior until the running server and its workflow have been verified.
 Validate a change from the repository root with:
 
 ```sh
-python3 /Users/danoved/.codex/skills/.system/plugin-creator/scripts/validate_plugin.py agent-plugin
+pnpm run check
+pnpm run smoke # with OBS and the sidecar running
 ```
+
+The automated plugin test keeps the Claude and Codex identities, versions,
+repositories, and MCP endpoint aligned and rejects premature `skills/` or
+`commands/` content. Skills remain deferred until live tool use establishes a
+stable operating workflow.

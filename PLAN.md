@@ -30,8 +30,11 @@ OBS capture engine → Source Record / camera / display files
 ```
 
 The singleton is important: multiple chat sessions must not race over the same
-recording. It also owns snapshots of temporary OBS state and the information
-needed to restore that state after a session.
+recording. A fixed listening port only prevents duplicate HTTP listeners; it
+does not prove which process owns a future recording mutation. An atomic
+per-user inter-process lock now establishes that owner independently of the
+chosen HTTP port. That owner will also hold snapshots of temporary OBS state
+and the information needed to restore it after a session.
 
 ### Security model
 
@@ -84,9 +87,10 @@ silently fails or is distorted.
 ## Migration status
 
 The existing Go CLI and its direct FFmpeg capture path are retired/superseded
-as the forward-looking design. Keep the code in place during migration: it is
-useful evidence for prior manifest, graceful shutdown, and validation work.
-Do not delete it merely to make the repository look TypeScript-only. New
+as the forward-looking design. That tree is frozen, unverified legacy and is
+excluded from the default TypeScript check. Keep it in place during migration:
+it is useful evidence for prior manifest, graceful shutdown, and validation
+work. Do not delete it merely to make the repository look TypeScript-only. New
 capture behavior belongs in OBS plus the TypeScript sidecar.
 
 ## Milestones

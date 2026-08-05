@@ -12,7 +12,8 @@
     "build": "tsc -p tsconfig.build.json",
     "check": "pnpm run lint && pnpm run typecheck && pnpm run test",
     "dev": "tsx server/index.ts",
-    "lint": "eslint server tests",
+    "lint": "eslint server tests eslint.config.mjs vitest.config.ts",
+    "smoke": "node --input-type=module --eval \"import { Client } from '@modelcontextprotocol/sdk/client/index.js'; import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'; const client = new Client({ name: 'scenecap-smoke', version: '0.1.0' }); await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:3233/mcp'))); try { console.log(JSON.stringify({ tools: await client.listTools(), status: await client.callTool({ name: 'get_status', arguments: {} }) }, null, 2)); } finally { await client.close(); }\"",
     "start": "node dist/server/index.js",
     "test": "vitest run tests",
     "typecheck": "tsc --noEmit"

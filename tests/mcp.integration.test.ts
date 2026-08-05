@@ -1,3 +1,4 @@
+import { request, type IncomingHttpHeaders } from "node:http";
 import { createServer } from "node:net";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -56,14 +57,88 @@ describe("MCP HTTP sidecar", () => {
     await client.close();
   });
 
-  it("does not expose a proxy path and rejects non-loopback Host headers", async () => {
+  it("rejects spoofed Host, proxy, and browser Origin requests before MCP handling", async () => {
     const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => new FakeObsSocket()));
-    const base = `http://127.0.0.1:${sidecar.listeningPort}/mcp`;
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
 
-    const proxied = await fetch(base, { headers: { "x-forwarded-for": "203.0.113.1" } });
-    expect(proxied.status).toBe(400);
-    const rebinding = await fetch(base, { headers: { host: "untrusted.example" } });
-    expect(rebinding.status).toBeGreaterThanOrEqual(400);
+    await expect(
+      rawMcpRequest(port, { headers: { host: "untrusted.example" } }),
+    ).resolves.toMatchObject({
+      body: '{"jsonrpc":"2.0","error":{"code":-32000,"message":"Invalid Host: untrusted.example"},"id":null}',
+      status: 403,
+    });
+    await expect(
+      rawMcpRequest(port, { headers: { "x-forwarded-for": "203.0.113.1" } }),
+    ).resolves.toMatchObject({ body: '{"error":"Loopback requests cannot be proxied."}', status: 400 });
+    await expect(
+      rawMcpRequest(port, { headers: { origin: "https://evil.example" } }),
+    ).resolves.toMatchObject({ body: '{"error":"Browser origins are not permitted."}', status: 403 });
+  });
+
+  it("returns 400 for a non-initialize request without a session and 404 for unknown sessions", async () => {
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => new FakeObsSocket()));
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+
+    await expect(rawMcpRequest(port, { body: listToolsRequest() })).resolves.toMatchObject({
+      body: '{"error":{"code":-32000,"message":"Bad Request: Mcp-Session-Id header is required"},"id":null,"jsonrpc":"2.0"}',
+      status: 400,
+    });
+    await expect(
+      rawMcpRequest(port, { body: listToolsRequest(), headers: { "mcp-session-id": "missing-session" } }),
+    ).resolves.toMatchObject({
+      body: '{"error":{"code":-32001,"message":"Session not found"},"id":null,"jsonrpc":"2.0"}',
+      status: 404,
+    });
+  });
+
+  it("removes a terminated session so clients recover with a 404", async () => {
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => new FakeObsSocket()));
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+
+    const initialized = await rawMcpRequest(port, { body: initializeRequest() });
+    expect(initialized.status).toBe(200);
+    const sessionIdHeader = initialized.headers["mcp-session-id"];
+    const sessionId = Array.isArray(sessionIdHeader) ? sessionIdHeader[0] : sessionIdHeader;
+    expect(sessionId).toMatch(/^[0-9a-f-]{36}$/i);
+    if (!sessionId) throw new Error("Initialize response did not include an MCP session ID.");
+
+    await expect(
+      rawMcpRequest(port, {
+        headers: { "mcp-session-id": sessionId, "mcp-protocol-version": "2025-11-25" },
+        method: "DELETE",
+      }),
+    ).resolves.toMatchObject({ body: "", status: 200 });
+    await expect(
+      rawMcpRequest(port, {
+        body: listToolsRequest(),
+        headers: { "mcp-session-id": sessionId, "mcp-protocol-version": "2025-11-25" },
+      }),
+    ).resolves.toMatchObject({
+      body: '{"error":{"code":-32001,"message":"Session not found"},"id":null,"jsonrpc":"2.0"}',
+      status: 404,
+    });
+  });
+
+  it("keeps concurrent MCP sessions independent", async () => {
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => new FakeObsSocket()));
+    const port = sidecar.listeningPort;
+    if (!port) throw new Error("Sidecar did not expose a listening port.");
+    const endpoint = new URL(`http://127.0.0.1:${port}/mcp`);
+
+    const first = new Client({ name: "first", version: "0.0.0" });
+    const second = new Client({ name: "second", version: "0.0.0" });
+    await Promise.all([
+      first.connect(new StreamableHTTPClientTransport(endpoint)),
+      second.connect(new StreamableHTTPClientTransport(endpoint)),
+    ]);
+    await expect(Promise.all([first.listTools(), second.listTools()])).resolves.toEqual([
+      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
+      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
+    ]);
+    await Promise.all([first.close(), second.close()]);
   });
 
   it("fails rather than sharing a port with another sidecar", async () => {
@@ -126,4 +201,62 @@ async function unusedPort(): Promise<number> {
   const { port } = address;
   await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   return port;
+}
+
+interface RawMcpRequest {
+  body?: object;
+  headers?: Record<string, string>;
+  method?: "DELETE" | "GET" | "POST";
+}
+
+interface RawMcpResponse {
+  body: string;
+  headers: IncomingHttpHeaders;
+  status: number;
+}
+
+function rawMcpRequest(port: number, options: RawMcpRequest = {}): Promise<RawMcpResponse> {
+  const payload = options.body ? JSON.stringify(options.body) : undefined;
+  return new Promise((resolve, reject) => {
+    const clientRequest = request({
+      headers: {
+        accept: "application/json, text/event-stream",
+        ...(payload ? { "content-length": String(Buffer.byteLength(payload)), "content-type": "application/json" } : {}),
+        host: `127.0.0.1:${port}`,
+        ...options.headers,
+      },
+      host: "127.0.0.1",
+      method: options.method ?? "POST",
+      path: "/mcp",
+      port,
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        body += chunk;
+      });
+      response.on("end", () => {
+        resolve({ body, headers: response.headers, status: response.statusCode ?? 0 });
+      });
+    });
+    clientRequest.once("error", reject);
+    clientRequest.end(payload);
+  });
+}
+
+function initializeRequest(): object {
+  return {
+    id: 1,
+    jsonrpc: "2.0",
+    method: "initialize",
+    params: {
+      capabilities: {},
+      clientInfo: { name: "raw-test", version: "0.0.0" },
+      protocolVersion: "2025-11-25",
+    },
+  };
+}
+
+function listToolsRequest(): object {
+  return { id: 2, jsonrpc: "2.0", method: "tools/list", params: {} };
 }

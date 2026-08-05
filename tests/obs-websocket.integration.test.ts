@@ -93,7 +93,7 @@ function responseFor(requestType: string): Record<string, unknown> {
     case "GetVersion":
       return { obsVersion: "31.0.0", obsWebSocketVersion: "5.5.0" };
     case "GetInputKindList":
-      return { inputKinds: ["macos-screen-capture"] };
+      return { inputKinds: ["display_capture"] };
     case "GetSourceFilterKindList":
       return { sourceFilterKinds: ["crop_filter", "source_record_filter"] };
     default:

@@ -18,7 +18,7 @@ class FakeObsSocket implements ObsSocket {
       return { obsVersion: "31.0.0", obsWebSocketVersion: "5.5.0" };
     }
     if (requestType === "GetInputKindList") {
-      return { inputKinds: ["macos-screen-capture"] };
+      return { inputKinds: ["display_capture"] };
     }
     return { sourceFilterKinds: ["crop_filter", "source_record_filter"] };
   }
@@ -45,9 +45,7 @@ describe("readObsStatus", () => {
     expect(socket.disconnected).toBe(true);
     expect(status).toEqual({
       capabilities: { screen_capture: true, source_record_filter: true },
-      inputKinds: ["macos-screen-capture"],
       obsVersion: "31.0.0",
-      sourceFilterKinds: ["crop_filter", "source_record_filter"],
       websocketVersion: "5.5.0",
     });
   });
@@ -59,8 +57,76 @@ describe("readObsStatus", () => {
 
     await expect(
       readObsStatus({ host: "127.0.0.1", password: "test-secret", port: 4455 }, () => socket, controller.signal),
-    ).rejects.toMatchObject({ name: "AbortError" });
+    ).rejects.toMatchObject({ kind: "cancelled" });
     expect(socket.connectedWith).toBeUndefined();
     expect(socket.calls).toEqual([]);
   });
+
+  it("times out during the OBS Hello handshake and disconnects", async () => {
+    const socket = new HangingConnectSocket();
+
+    await expect(
+      readObsStatus(
+        { host: "127.0.0.1", password: "test-secret", port: 4455 },
+        () => socket,
+        { timeoutMs: 10 },
+      ),
+    ).rejects.toMatchObject({ kind: "timeout" });
+    expect(socket.disconnected).toBe(true);
+  });
+
+  it("cancels during an OBS response and disconnects", async () => {
+    const socket = new HangingRequestSocket();
+    const controller = new AbortController();
+    const requestStarted = socket.waitForRequest();
+    const pending = readObsStatus(
+      { host: "127.0.0.1", password: "test-secret", port: 4455 },
+      () => socket,
+      { signal: controller.signal, timeoutMs: 1_000 },
+    );
+    await requestStarted;
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "cancelled" });
+    expect(socket.disconnected).toBe(true);
+  });
 });
+
+class HangingConnectSocket implements ObsSocket {
+  disconnected = false;
+
+  async connect(): Promise<void> {
+    await new Promise<void>(() => undefined);
+  }
+
+  async call(): Promise<unknown> {
+    throw new Error("No request should be issued before Hello completes.");
+  }
+
+  disconnect(): void {
+    this.disconnected = true;
+  }
+}
+
+class HangingRequestSocket implements ObsSocket {
+  disconnected = false;
+  #requestStarted!: () => void;
+  readonly #requestStartedPromise = new Promise<void>((resolve) => {
+    this.#requestStarted = resolve;
+  });
+
+  async connect(): Promise<void> {}
+
+  async call(): Promise<unknown> {
+    this.#requestStarted();
+    return new Promise<never>(() => undefined);
+  }
+
+  disconnect(): void {
+    this.disconnected = true;
+  }
+
+  waitForRequest(): Promise<void> {
+    return this.#requestStartedPromise;
+  }
+}

@@ -72,6 +72,15 @@ describe("loadConfig", () => {
     expect(config.obs).toEqual({ host: "127.0.0.1", password: "file-secret", port: 4456 });
   });
 
+  it("does not let an empty SCENECAP_OBS_PORT override OBS config", async () => {
+    const config = await loadConfig({
+      env: { SCENECAP_OBS_CONFIG: "/private/config.json", SCENECAP_OBS_PORT: "" },
+      readConfigFile: async () => JSON.stringify({ server_password: "file-secret", server_port: 4456 }),
+    });
+
+    expect(config.obs.port).toBe(4456);
+  });
+
   it.each([
     [{ SCENECAP_PORT: "0" }, "SCENECAP_PORT"],
     [{ SCENECAP_PORT: "3233.5" }, "SCENECAP_PORT"],
@@ -91,17 +100,19 @@ describe("loadConfig", () => {
   });
 
   it("refuses missing or invalid OBS passwords without leaking a file secret", async () => {
+    const failure = await loadConfig(
+      {
+        env: { SCENECAP_OBS_CONFIG: "/private/config.json" },
+        readConfigFile: async () => JSON.stringify({ server_password: { secret: "never-show-this" } }),
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ message: "OBS WebSocket password is required." });
+    expect(String(failure)).not.toContain("never-show-this");
     await expect(
       loadConfig({
         env: { SCENECAP_OBS_CONFIG: "/private/config.json" },
         readConfigFile: async () => JSON.stringify({ server_password: "" }),
       }),
     ).rejects.toThrow("password is required");
-    await expect(
-      loadConfig({
-        env: { SCENECAP_OBS_CONFIG: "/private/config.json" },
-        readConfigFile: async () => JSON.stringify({ server_password: { secret: "never-show-this" } }),
-      }),
-    ).rejects.not.toThrow("never-show-this");
   });
 });
