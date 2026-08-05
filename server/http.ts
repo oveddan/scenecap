@@ -29,7 +29,7 @@ interface Session {
 }
 
 const DEFAULT_MAX_SESSIONS = 16;
-const DEFAULT_SESSION_IDLE_TTL_MS = 5 * 60_000;
+const DEFAULT_SESSION_IDLE_TTL_MS = 60 * 60_000;
 
 let activeSidecar: { owner: McpHttpSidecar; port: number } | undefined;
 

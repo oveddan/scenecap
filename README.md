@@ -77,7 +77,9 @@ codex mcp add scenecap --url http://127.0.0.1:3233/mcp
 These are local MCP connection commands, not marketplace installation
 commands. The shared development bundle lives in [`agent-plugin/`](agent-plugin/)
 and points both hosts at the same endpoint. It connects to the sidecar; it does
-not launch it.
+not launch it. The sidecar retains at most 16 MCP sessions and expires an idle
+session after one hour, which accommodates pauses during a recording workflow
+without allowing abandoned clients to accumulate indefinitely.
 
 ### Configuration
 
