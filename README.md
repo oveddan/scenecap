@@ -25,6 +25,8 @@ Use `--obs-config /path/to/config.json` to override that location. Do not put
 a password on the command line: command arguments can be visible to other
 local processes. The check uses only `GetVersion`, `GetInputKindList`, and
 `GetSourceFilterKindList`; it changes no scene, source, filter, or recording.
+Use `--address 127.0.0.1:4455` to select a literal loopback endpoint and
+`--timeout 5s` to set the connection/request deadline.
 
 For this initial slice scenecap itself will connect only to literal loopback
 addresses (`127.0.0.0/8` or `::1`). That does **not** make OBS's WebSocket
@@ -60,6 +62,9 @@ guarded scene selection; it will not start recording until that design is
 explicitly reviewed.
 
 The old commands are kept for the existing FFmpeg experiment:
+
+`devices` may trigger macOS privacy prompts. Run `doctor` first; it only checks
+installed tools and encoder availability.
 
 ```sh
 ./scenecap doctor

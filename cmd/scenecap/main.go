@@ -65,7 +65,7 @@ func obsDoctor(args []string) error {
 	if *timeout <= 0 {
 		return errors.New("--timeout must be positive")
 	}
-	if err := obswsAddress(*address); err != nil {
+	if err := obsws.ValidateAddress(*address); err != nil {
 		return err
 	}
 	if *configPath == "" {
@@ -86,18 +86,10 @@ func obsDoctor(args []string) error {
 		return fmt.Errorf("OBS diagnostics: %w", err)
 	}
 	fmt.Printf("OBS: %s; WebSocket: %s\n", report.OBSVersion, report.WebSocketVersion)
-	fmt.Printf("CallVendorRequest: %s\n", check(report.CallVendorRequest))
 	fmt.Printf("screen_capture: %s\n", check(report.ScreenCapture))
 	fmt.Printf("source_record_filter: %s\n", check(report.SourceRecord))
-	if !report.CallVendorRequest || !report.ScreenCapture || !report.SourceRecord {
+	if !report.ScreenCapture || !report.SourceRecord {
 		return errors.New("OBS is missing one or more required v1 capabilities")
-	}
-	return nil
-}
-
-func obswsAddress(address string) error {
-	if err := obsws.ValidateAddress(address); err != nil {
-		return err
 	}
 	return nil
 }

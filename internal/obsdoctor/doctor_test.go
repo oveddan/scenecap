@@ -45,12 +45,12 @@ func TestPasswordRejectsInvalidConfig(t *testing.T) {
 }
 
 func TestInterpret(t *testing.T) {
-	report := Interpret("31.0", "5.5", []string{"CallVendorRequest"}, []string{"screen_capture"}, []string{"source_record_filter"})
-	if !report.CallVendorRequest || !report.ScreenCapture || !report.SourceRecord {
+	report := Interpret("31.0", "5.5", []string{"screen_capture"}, []string{"source_record_filter"})
+	if !report.ScreenCapture || !report.SourceRecord {
 		t.Fatalf("Interpret() = %#v, want all capabilities", report)
 	}
-	report = Interpret("31.0", "5.5", nil, nil, nil)
-	if report.CallVendorRequest || report.ScreenCapture || report.SourceRecord {
+	report = Interpret("31.0", "5.5", nil, nil)
+	if report.ScreenCapture || report.SourceRecord {
 		t.Fatalf("Interpret() = %#v, want missing capabilities", report)
 	}
 }
@@ -94,7 +94,7 @@ func TestCheckUsesOnlyExpectedReadRequests(t *testing.T) {
 				panic(err)
 			}
 			got = append(got, d.RequestType)
-			data := any(map[string]any{"obsVersion": "31.0", "obsWebSocketVersion": "5.5", "availableRequests": []string{"CallVendorRequest"}})
+			data := any(map[string]any{"obsVersion": "31.0", "obsWebSocketVersion": "5.5"})
 			if d.RequestType == "GetInputKindList" {
 				data = map[string]any{"inputKinds": []string{"screen_capture"}}
 			}
@@ -111,7 +111,7 @@ func TestCheckUsesOnlyExpectedReadRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !report.CallVendorRequest || !report.ScreenCapture || !report.SourceRecord {
+	if !report.ScreenCapture || !report.SourceRecord {
 		t.Fatalf("Check() = %#v", report)
 	}
 	select {

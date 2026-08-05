@@ -17,11 +17,10 @@ import (
 const DefaultAddress = "127.0.0.1:4455"
 
 type Report struct {
-	OBSVersion        string
-	WebSocketVersion  string
-	CallVendorRequest bool
-	ScreenCapture     bool
-	SourceRecord      bool
+	OBSVersion       string
+	WebSocketVersion string
+	ScreenCapture    bool
+	SourceRecord     bool
 }
 
 // Check connects to OBS and makes only GetVersion, GetInputKindList, and
@@ -58,7 +57,7 @@ func Check(ctx context.Context, address, password string) (Report, error) {
 		return Report{}, fmt.Errorf("GetSourceFilterKindList: %w", err)
 	}
 
-	return Interpret(version.OBSVersion, version.OBSWebSocketVersion, version.AvailableRequests, inputs, filters), nil
+	return Interpret(version.OBSVersion, version.OBSWebSocketVersion, inputs, filters), nil
 }
 
 func versionMajor(version string) (int, error) {
@@ -71,13 +70,12 @@ func versionMajor(version string) (int, error) {
 }
 
 // Interpret converts OBS's capability lists into the stable diagnostics report.
-func Interpret(obsVersion, websocketVersion string, requests, inputs, filters []string) Report {
+func Interpret(obsVersion, websocketVersion string, inputs, filters []string) Report {
 	return Report{
-		OBSVersion:        obsVersion,
-		WebSocketVersion:  websocketVersion,
-		CallVendorRequest: contains(requests, "CallVendorRequest"),
-		ScreenCapture:     contains(inputs, "screen_capture"),
-		SourceRecord:      contains(filters, "source_record_filter"),
+		OBSVersion:       obsVersion,
+		WebSocketVersion: websocketVersion,
+		ScreenCapture:    contains(inputs, "screen_capture"),
+		SourceRecord:     contains(filters, "source_record_filter"),
 	}
 }
 

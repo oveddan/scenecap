@@ -26,11 +26,14 @@ func TestConnectChallengeAuthenticationAndReadRequests(t *testing.T) {
 			panic(fmt.Sprintf("Identify op = %d, want 1", identify.Op))
 		}
 		var d struct {
-			RPCVersion     int    `json:"rpcVersion"`
-			Authentication string `json:"authentication"`
+			RPCVersion         int    `json:"rpcVersion"`
+			Authentication     string `json:"authentication"`
+			EventSubscriptions int    `json:"eventSubscriptions"`
 		}
 		decode(t, identify.D, &d)
-		if d.RPCVersion != 1 || d.Authentication != challengeResponse(password, "salt", "challenge") {
+		var raw map[string]json.RawMessage
+		decode(t, identify.D, &raw)
+		if _, ok := raw["eventSubscriptions"]; !ok || d.RPCVersion != 1 || d.EventSubscriptions != 0 || d.Authentication != challengeResponse(password, "salt", "challenge") {
 			panic("Identify did not use the expected RPC v1 challenge response")
 		}
 		write(t, ctx, c, 2, map[string]any{"negotiatedRpcVersion": 1})
@@ -41,10 +44,15 @@ func TestConnectChallengeAuthenticationAndReadRequests(t *testing.T) {
 				RequestID   string `json:"requestId"`
 			}
 			decode(t, request.D, &d)
+			var raw map[string]json.RawMessage
+			decode(t, request.D, &raw)
+			if _, ok := raw["requestData"]; ok {
+				panic("read-only request unexpectedly included requestData")
+			}
 			var data any
 			switch d.RequestType {
 			case "GetVersion":
-				data = map[string]any{"obsVersion": "31.0.0", "obsWebSocketVersion": "5.5.0", "availableRequests": []string{"CallVendorRequest"}}
+				data = map[string]any{"obsVersion": "31.0.0", "obsWebSocketVersion": "5.5.0"}
 			case "GetInputKindList":
 				data = map[string]any{"inputKinds": []string{"screen_capture"}}
 			case "GetSourceFilterKindList":
@@ -237,6 +245,8 @@ func TestValidateAddress(t *testing.T) {
 		{"127.0.0.1:4455", true},
 		{"127.255.255.255:1", true},
 		{"[::1]:4455", true},
+		{"[::ffff:127.0.0.1]:4455", false},
+		{"[::1%lo0]:4455", false},
 		{"localhost:4455", false},
 		{"10.0.0.1:4455", false},
 		{"127.0.0.1:0", false},

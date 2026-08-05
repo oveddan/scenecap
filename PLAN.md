@@ -47,7 +47,6 @@ put a password in a CLI flag or shell argv.
 It reports OBS and obs-websocket versions plus the advertised / installed
 capabilities required by this backend:
 
-- `CallVendorRequest`
 - `screen_capture`
 - `source_record_filter`
 

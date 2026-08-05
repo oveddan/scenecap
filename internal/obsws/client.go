@@ -80,8 +80,9 @@ type identified struct {
 }
 
 type identify struct {
-	RPCVersion     int    `json:"rpcVersion"`
-	Authentication string `json:"authentication,omitempty"`
+	RPCVersion         int    `json:"rpcVersion"`
+	Authentication     string `json:"authentication,omitempty"`
+	EventSubscriptions int    `json:"eventSubscriptions"`
 }
 
 type response struct {
@@ -154,7 +155,7 @@ func Connect(ctx context.Context, address, password string) (*Client, error) {
 	if password == "" {
 		return fail(errors.New("OBS WebSocket requires a password; set SCENECAP_OBS_PASSWORD or provide a config file"))
 	}
-	id := identify{RPCVersion: 1, Authentication: authentication(password, h.Authentication.Salt, h.Authentication.Challenge)}
+	id := identify{RPCVersion: 1, Authentication: authentication(password, h.Authentication.Salt, h.Authentication.Challenge), EventSubscriptions: 0}
 	if err := writeEnvelope(ctx, conn, opIdentify, id); err != nil {
 		return fail(fmt.Errorf("send OBS Identify: %w", err))
 	}
@@ -189,9 +190,14 @@ func (c *Client) request(ctx context.Context, requestType string, requestData an
 	if requestType == "" {
 		return nil, errors.New("OBS request type is required")
 	}
-	data, err := json.Marshal(requestData)
-	if err != nil {
-		return nil, fmt.Errorf("encode OBS request data: %w", err)
+	var data *json.RawMessage
+	if requestData != nil {
+		encoded, err := json.Marshal(requestData)
+		if err != nil {
+			return nil, fmt.Errorf("encode OBS request data: %w", err)
+		}
+		value := json.RawMessage(encoded)
+		data = &value
 	}
 	id := fmt.Sprintf("scenecap-%d", c.nextID.Add(1))
 	ch := make(chan response, 1)
@@ -201,12 +207,12 @@ func (c *Client) request(ctx context.Context, requestType string, requestData an
 	defer c.removePending(id)
 
 	request := struct {
-		RequestType string          `json:"requestType"`
-		RequestID   string          `json:"requestId"`
-		RequestData json.RawMessage `json:"requestData,omitempty"`
+		RequestType string           `json:"requestType"`
+		RequestID   string           `json:"requestId"`
+		RequestData *json.RawMessage `json:"requestData,omitempty"`
 	}{requestType, id, data}
 	c.writeMu.Lock()
-	err = writeEnvelope(ctx, c.conn, opRequest, request)
+	err := writeEnvelope(ctx, c.conn, opRequest, request)
 	c.writeMu.Unlock()
 	if err != nil {
 		return nil, fmt.Errorf("send OBS request: %w", err)
@@ -227,12 +233,11 @@ func (c *Client) request(ctx context.Context, requestType string, requestData an
 
 // Version is the response to OBS's read-only GetVersion request.
 type Version struct {
-	OBSVersion          string   `json:"obsVersion"`
-	OBSWebSocketVersion string   `json:"obsWebSocketVersion"`
-	AvailableRequests   []string `json:"availableRequests"`
+	OBSVersion          string `json:"obsVersion"`
+	OBSWebSocketVersion string `json:"obsWebSocketVersion"`
 }
 
-// GetVersion queries OBS version and request support.
+// GetVersion queries the OBS and obs-websocket versions.
 func (c *Client) GetVersion(ctx context.Context) (Version, error) {
 	data, err := c.request(ctx, "GetVersion", nil)
 	if err != nil {
