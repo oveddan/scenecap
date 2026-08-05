@@ -1,13 +1,13 @@
-.PHONY: build test check
+.PHONY: build test check start
 
 build:
-	go build -o scenecap ./cmd/scenecap
+	pnpm run build
 
 test:
-	go test ./...
+	pnpm run test
 
 check:
-	gofmt -w cmd internal
-	go vet ./...
-	go test ./...
+	pnpm run check
 
+start:
+	pnpm start

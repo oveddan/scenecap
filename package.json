@@ -1,0 +1,38 @@
+{
+  "name": "scenecap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback-only MCP sidecar for safe OBS recording control.",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run test",
+    "dev": "tsx server/index.ts",
+    "lint": "eslint server tests eslint.config.mjs vitest.config.ts",
+    "smoke": "node --input-type=module --eval \"import { Client } from '@modelcontextprotocol/sdk/client/index.js'; import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'; const client = new Client({ name: 'scenecap-smoke', version: '0.1.0' }); await client.connect(new StreamableHTTPClientTransport(new URL('http://127.0.0.1:3233/mcp'))); try { console.log(JSON.stringify({ tools: await client.listTools(), status: await client.callTool({ name: 'get_status', arguments: {} }) }, null, 2)); } finally { await client.close(); }\"",
+    "start": "node dist/server/index.js",
+    "test": "vitest run tests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "obs-websocket-js": "^5.0.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.10.1",
+    "@types/ws": "^8.18.1",
+    "eslint": "^10.8.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.66.0",
+    "vitest": "^4.0.17",
+    "ws": "^8.21.2"
+  }
+}
