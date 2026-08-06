@@ -19,6 +19,7 @@ describe("get_status failure reporting", () => {
     [Object.assign(new Error("closed"), { code: 4009 }), "OBS authentication failed."],
     [new Error("connect ECONNREFUSED"), "OBS is unavailable or refused the connection."],
     [new Error("Not connected"), "OBS is unavailable or refused the connection."],
+    [Object.assign(new Error(""), { code: 1006 }), "OBS is unavailable or refused the connection."],
     [new Error("invalid subprotocol"), "OBS WebSocket protocol is incompatible."],
     [Object.assign(new Error("closed"), { code: 4010 }), "OBS WebSocket protocol is incompatible."],
     [new Error("secret-other-error"), "OBS preflight failed for an unknown reason."],

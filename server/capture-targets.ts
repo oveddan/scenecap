@@ -168,24 +168,27 @@ export async function readCaptureTargets(
     }
 
     const targets = snapshots.flatMap(toConfiguredCaptureTarget);
-    for (const probeInput of representativeScreenProbes(screenInputs)) {
-      try {
-        targets.push(...await readPropertyTargets(
-          socket,
-          probeInput,
-          WINDOW_PROBE,
-          options,
-          deadline,
-        ));
-      } catch (error) {
-        if (classifyObsFailure(error) !== "unknown") throw error;
-        const inputName = cleanLabel(probeInput.inputName) ?? "Unnamed capture input";
-        limitations.push({
-          code: "input_unavailable",
-          inputName,
-          kind: "window",
-          message: `OBS input '${inputName}' changed or became unavailable while listing windows.`,
-        });
+    for (const probeGroup of screenProbeGroups(screenInputs)) {
+      for (const probeInput of probeGroup) {
+        try {
+          targets.push(...await readPropertyTargets(
+            socket,
+            probeInput,
+            WINDOW_PROBE,
+            options,
+            deadline,
+          ));
+          break;
+        } catch (error) {
+          if (classifyObsFailure(error) !== "unknown") throw error;
+          const inputName = cleanLabel(probeInput.inputName) ?? "Unnamed capture input";
+          limitations.push({
+            code: "input_unavailable",
+            inputName,
+            kind: "window",
+            message: `OBS input '${inputName}' changed or became unavailable while listing windows.`,
+          });
+        }
       }
     }
     const { boundedTargets, truncatedKinds } = boundAndDedupeTargets(targets);
@@ -277,19 +280,24 @@ function isSupportedCaptureInput(input: ObsInput): boolean {
   return input.inputKind === "screen_capture" || CAMERA_INPUT_KINDS.has(input.inputKind);
 }
 
-function representativeScreenProbes(inputs: InputSnapshot[]): InputSnapshot[] {
-  const representatives = new Map<string, InputSnapshot>();
+function screenProbeGroups(inputs: InputSnapshot[]): InputSnapshot[][] {
+  const groups = new Map<string, InputSnapshot[]>();
   for (const input of [...inputs].sort((left, right) => left.inputName.localeCompare(right.inputName))) {
     const key = [
+      input.settings.type ?? 0,
       input.settings.show_hidden_windows === true,
       input.settings.show_empty_names === true,
     ].join(":");
-    if (!representatives.has(key)) representatives.set(key, input);
+    const group = groups.get(key) ?? [];
+    group.push(input);
+    groups.set(key, group);
   }
-  return [...representatives.values()].sort((left, right) => {
+  return [...groups.values()].sort((left, right) => {
     const breadth = (input: InputSnapshot) =>
       Number(input.settings.show_hidden_windows === true) + Number(input.settings.show_empty_names === true);
-    return breadth(right) - breadth(left) || left.inputName.localeCompare(right.inputName);
+    const leftInput = left[0] as InputSnapshot;
+    const rightInput = right[0] as InputSnapshot;
+    return breadth(rightInput) - breadth(leftInput) || leftInput.inputName.localeCompare(rightInput.inputName);
   });
 }
 

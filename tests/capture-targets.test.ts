@@ -350,6 +350,12 @@ describe("readCaptureTargets", () => {
 
   it("unions distinct window-list configurations and continues after a stale broad probe", async () => {
     const propertyProbeNames: string[] = [];
+    const itemValues: Record<string, number> = {
+      "Empty Only": 20,
+      "Hidden Display": 30,
+      "Hidden Only": 10,
+      "Zulu Broad Backup": 40,
+    };
     const socket: ObsSocket = {
       async connect() {},
       async request(request) {
@@ -357,14 +363,19 @@ describe("readCaptureTargets", () => {
           return {
             inputs: [
               { inputKind: "screen_capture", inputName: "Hidden Only", inputUuid: "hidden" },
+              { inputKind: "screen_capture", inputName: "Hidden Display", inputUuid: "hidden-display" },
               { inputKind: "screen_capture", inputName: "Empty Only", inputUuid: "empty" },
               { inputKind: "screen_capture", inputName: "Zulu Broad", inputUuid: "broad" },
+              { inputKind: "screen_capture", inputName: "Zulu Broad Backup", inputUuid: "broad-backup" },
             ],
           };
         }
         if (request.type === "GetInputSettings") {
           if (request.data.inputName === "Hidden Only") {
             return { inputSettings: { show_hidden_windows: true, type: 1 } };
+          }
+          if (request.data.inputName === "Hidden Display") {
+            return { inputSettings: { show_hidden_windows: true, type: 0 } };
           }
           if (request.data.inputName === "Empty Only") {
             return { inputSettings: { show_empty_names: true, type: 1 } };
@@ -380,7 +391,7 @@ describe("readCaptureTargets", () => {
             propertyItems: [{
               itemEnabled: true,
               itemName: `${request.data.inputName} Window`,
-              itemValue: request.data.inputName === "Hidden Only" ? 10 : 20,
+              itemValue: itemValues[request.data.inputName],
             }],
           };
         }
@@ -394,9 +405,17 @@ describe("readCaptureTargets", () => {
       () => socket,
     );
 
-    expect(propertyProbeNames).toEqual(["Zulu Broad", "Empty Only", "Hidden Only"]);
+    expect(propertyProbeNames).toEqual([
+      "Zulu Broad",
+      "Zulu Broad Backup",
+      "Empty Only",
+      "Hidden Display",
+      "Hidden Only",
+    ]);
     expect(result.targets.map((target) => target.label)).toEqual([
+      "Zulu Broad Backup Window",
       "Empty Only Window",
+      "Hidden Display Window",
       "Hidden Only Window",
     ]);
     expect(result.limitations).toContainEqual(expect.objectContaining({

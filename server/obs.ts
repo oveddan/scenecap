@@ -164,6 +164,9 @@ export function classifyObsFailure(error: unknown): ObsFailureKind {
   if (code === 4010 || /unsupported protocol|invalid subprotocol|rpc version|incompatible protocol/.test(message)) {
     return "incompatible_protocol";
   }
+  if (typeof code === "number" && code >= 1_000 && code <= 4_999) {
+    return "obs_unavailable";
+  }
   if (
     /econnrefused|econnreset|enotfound|connection refused|not connected|socket not identified|unexpected server response/.test(message)
   ) {
