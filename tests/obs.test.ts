@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ObsConnectionOptions, ObsSocket } from "../server/obs.js";
+import type { ObsConnectionOptions, ObsReadRequest, ObsSocket } from "../server/obs.js";
 import { readObsStatus } from "../server/obs.js";
 
 class FakeObsSocket implements ObsSocket {
@@ -12,12 +12,12 @@ class FakeObsSocket implements ObsSocket {
     this.connectedWith = options;
   }
 
-  async call(requestType: "GetVersion" | "GetInputKindList" | "GetSourceFilterKindList"): Promise<unknown> {
-    this.calls.push(requestType);
-    if (requestType === "GetVersion") {
+  async request(request: ObsReadRequest): Promise<unknown> {
+    this.calls.push(request.type);
+    if (request.type === "GetVersion") {
       return { obsVersion: "31.0.0", obsWebSocketVersion: "5.5.0" };
     }
-    if (requestType === "GetInputKindList") {
+    if (request.type === "GetInputKindList") {
       return { inputKinds: ["display_capture"] };
     }
     return { sourceFilterKinds: ["crop_filter", "source_record_filter"] };
@@ -112,7 +112,7 @@ class HangingConnectSocket implements ObsSocket {
     await new Promise<void>(() => undefined);
   }
 
-  async call(): Promise<unknown> {
+  async request(): Promise<unknown> {
     throw new Error("No request should be issued before Hello completes.");
   }
 
@@ -130,7 +130,7 @@ class HangingRequestSocket implements ObsSocket {
 
   async connect(): Promise<void> {}
 
-  async call(): Promise<unknown> {
+  async request(): Promise<unknown> {
     this.#requestStarted();
     return new Promise<never>(() => undefined);
   }
@@ -153,10 +153,10 @@ class SlowSocket implements ObsSocket {
     await delay(this.delayMs);
   }
 
-  async call(requestType: "GetVersion" | "GetInputKindList" | "GetSourceFilterKindList"): Promise<unknown> {
+  async request(request: ObsReadRequest): Promise<unknown> {
     await delay(this.delayMs);
-    if (requestType === "GetVersion") return {};
-    if (requestType === "GetInputKindList") return { inputKinds: [] };
+    if (request.type === "GetVersion") return {};
+    if (request.type === "GetInputKindList") return { inputKinds: [] };
     return { sourceFilterKinds: [] };
   }
 
