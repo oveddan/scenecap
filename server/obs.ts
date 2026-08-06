@@ -25,11 +25,22 @@ export interface ObsConnectionOptions {
   password: string;
 }
 
+export type CapturePropertyName = "window";
+
+export type ObsReadRequest =
+  | { type: "GetInputKindList" }
+  | { type: "GetInputList" }
+  | { data: { inputName: string }; type: "GetInputSettings" }
+  | {
+      data: { inputName: string; propertyName: CapturePropertyName };
+      type: "GetInputPropertiesListPropertyItems";
+    }
+  | { type: "GetSourceFilterKindList" }
+  | { type: "GetVersion" };
+
 export interface ObsSocket {
   connect(options: ObsConnectionOptions): Promise<void>;
-  call(requestType: "GetVersion"): Promise<unknown>;
-  call(requestType: "GetInputKindList"): Promise<unknown>;
-  call(requestType: "GetSourceFilterKindList"): Promise<unknown>;
+  request(request: ObsReadRequest): Promise<unknown>;
   disconnect(): void | Promise<void>;
 }
 
@@ -59,10 +70,24 @@ export class ObsWebSocketAdapter implements ObsSocket {
     });
   }
 
-  async call(
-    requestType: "GetVersion" | "GetInputKindList" | "GetSourceFilterKindList",
-  ): Promise<unknown> {
-    return this.#socket.call(requestType);
+  async request(request: ObsReadRequest): Promise<unknown> {
+    switch (request.type) {
+      case "GetInputKindList":
+        return this.#socket.call("GetInputKindList");
+      case "GetInputList":
+        return this.#socket.call("GetInputList");
+      case "GetInputSettings":
+        return this.#socket.call("GetInputSettings", request.data);
+      case "GetInputPropertiesListPropertyItems":
+        // OBS 32.2.1 on macOS crashes when this request contains only an
+        // inputUuid. Always send the current input name and a property from
+        // our compile-time allowlist; neither field is caller-controlled.
+        return this.#socket.call("GetInputPropertiesListPropertyItems", request.data);
+      case "GetSourceFilterKindList":
+        return this.#socket.call("GetSourceFilterKindList");
+      case "GetVersion":
+        return this.#socket.call("GetVersion");
+    }
   }
 
   disconnect(): Promise<void> {
@@ -79,12 +104,12 @@ export async function readObsStatus(
   createSocket: ObsSocketFactory = createObsSocket,
   optionsOrSignal: ObsReadOptions | AbortSignal = {},
 ): Promise<ObsStatus> {
-  const options = normalizeOptions(optionsOrSignal);
+  const options = normalizeObsReadOptions(optionsOrSignal);
   const deadline = Date.now() + options.timeoutMs;
   throwIfAborted(options.signal);
   const socket = createSocket();
   try {
-    await bounded(socket, () => socket.connect({
+    await boundedObsRead(socket, () => socket.connect({
       // The destination is constructed from validated numeric loopback data.
       // No proxy URL, redirect URL, or caller-provided endpoint can enter this
       // adapter; the WebSocket connection is therefore a direct local handshake.
@@ -94,9 +119,19 @@ export async function readObsStatus(
     }), options, deadline);
 
     // This foundation intentionally makes only read-only capability calls.
-    const version = await bounded(socket, () => socket.call("GetVersion"), options, deadline);
-    const inputKinds = await bounded(socket, () => socket.call("GetInputKindList"), options, deadline);
-    const sourceFilterKinds = await bounded(socket, () => socket.call("GetSourceFilterKindList"), options, deadline);
+    const version = await boundedObsRead(socket, () => socket.request({ type: "GetVersion" }), options, deadline);
+    const inputKinds = await boundedObsRead(
+      socket,
+      () => socket.request({ type: "GetInputKindList" }),
+      options,
+      deadline,
+    );
+    const sourceFilterKinds = await boundedObsRead(
+      socket,
+      () => socket.request({ type: "GetSourceFilterKindList" }),
+      options,
+      deadline,
+    );
 
     const availableInputKinds = stringList(inputKinds, "inputKinds");
     const availableFilterKinds = stringList(sourceFilterKinds, "sourceFilterKinds");
@@ -109,7 +144,7 @@ export async function readObsStatus(
       websocketVersion: optionalString(version, "obsWebSocketVersion"),
     };
   } finally {
-    disconnectQuietly(socket);
+    disconnectObsQuietly(socket);
   }
 }
 
@@ -129,20 +164,25 @@ export function classifyObsFailure(error: unknown): ObsFailureKind {
   if (code === 4010 || /unsupported protocol|invalid subprotocol|rpc version|incompatible protocol/.test(message)) {
     return "incompatible_protocol";
   }
-  if (/econnrefused|econnreset|enotfound|connection refused|unexpected server response/.test(message)) {
+  if (typeof code === "number" && code >= 1_000 && code <= 4_999) {
+    return "obs_unavailable";
+  }
+  if (
+    /econnrefused|econnreset|enotfound|connection refused|not connected|socket not identified|unexpected server response/.test(message)
+  ) {
     return "obs_unavailable";
   }
   return "unknown";
 }
 
-async function bounded<T>(
+export async function boundedObsRead<T>(
   socket: ObsSocket,
   operation: () => Promise<T>,
   options: Required<ObsReadOptions>,
   deadline: number,
 ): Promise<T> {
   if (options.signal.aborted) {
-    disconnectQuietly(socket);
+    disconnectObsQuietly(socket);
     throw new ObsStatusError("cancelled");
   }
   let timeout: NodeJS.Timeout | undefined;
@@ -156,7 +196,7 @@ async function bounded<T>(
   try {
     return await Promise.race([operation(), interrupted]);
   } catch (error) {
-    if (error instanceof ObsStatusError) disconnectQuietly(socket);
+    if (error instanceof ObsStatusError) disconnectObsQuietly(socket);
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
@@ -164,7 +204,9 @@ async function bounded<T>(
   }
 }
 
-function normalizeOptions(optionsOrSignal: ObsReadOptions | AbortSignal): Required<ObsReadOptions> {
+export function normalizeObsReadOptions(
+  optionsOrSignal: ObsReadOptions | AbortSignal,
+): Required<ObsReadOptions> {
   const options = isAbortSignal(optionsOrSignal) ? { signal: optionsOrSignal } : optionsOrSignal;
   return {
     signal: options.signal ?? new AbortController().signal,
@@ -172,11 +214,11 @@ function normalizeOptions(optionsOrSignal: ObsReadOptions | AbortSignal): Requir
   };
 }
 
-function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
+export function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
   return "aborted" in value && "addEventListener" in value;
 }
 
-function disconnectQuietly(socket: ObsSocket): void {
+export function disconnectObsQuietly(socket: ObsSocket): void {
   void Promise.resolve(socket.disconnect()).catch(() => undefined);
 }
 

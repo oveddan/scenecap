@@ -5,6 +5,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 
+import { readCaptureTargets } from "../server/capture-targets.js";
 import { classifyObsFailure, readObsStatus } from "../server/obs.js";
 
 const servers: Array<{ close(): Promise<void> }> = [];
@@ -105,6 +106,58 @@ describe("ObsWebSocketAdapter", () => {
 
     expect(failure).toMatchObject({ code: 4009 });
     expect(classifyObsFailure(failure)).toBe("authentication_failed");
+  });
+
+  it("sends only inputName plus the allowlisted window property for live discovery", async () => {
+    const observed: Array<{ requestData?: unknown; requestType: string }> = [];
+    const fakeObs = await startObsServer((socket) => {
+      socket.send(message(0, { obsWebSocketVersion: "5.5.0", rpcVersion: 1 }));
+      socket.on("message", (raw) => {
+        const incoming = JSON.parse(raw.toString()) as { d: Record<string, unknown>; op: number };
+        if (incoming.op === 1) {
+          socket.send(message(2, { negotiatedRpcVersion: 1 }));
+          return;
+        }
+        if (incoming.op !== 6 || typeof incoming.d.requestType !== "string") return;
+        const requestType = incoming.d.requestType;
+        observed.push({ requestData: incoming.d.requestData, requestType });
+        const responseData = requestType === "GetInputList"
+          ? { inputs: [{ inputKind: "screen_capture", inputName: "Window Probe", inputUuid: "uuid" }] }
+          : requestType === "GetInputSettings"
+            ? { inputKind: "screen_capture", inputSettings: { show_hidden_windows: true, type: 1 } }
+            : requestType === "GetInputPropertiesListPropertyItems"
+              ? { propertyItems: [{ itemEnabled: true, itemName: "[Bitwig Studio] Project", itemValue: 42 }] }
+              : undefined;
+        if (!responseData) throw new Error(`Unexpected OBS request: ${requestType}`);
+        socket.send(message(7, {
+          requestId: incoming.d.requestId,
+          requestStatus: { code: 100, result: true },
+          responseData,
+          requestType,
+        }));
+      });
+    });
+
+    const result = await readCaptureTargets({
+      host: "127.0.0.1",
+      password: "unused-by-server",
+      port: fakeObs.port,
+    });
+
+    expect(observed).toEqual([
+      { requestData: undefined, requestType: "GetInputList" },
+      { requestData: { inputName: "Window Probe" }, requestType: "GetInputSettings" },
+      {
+        requestData: { inputName: "Window Probe", propertyName: "window" },
+        requestType: "GetInputPropertiesListPropertyItems",
+      },
+    ]);
+    expect(JSON.stringify(observed)).not.toContain("inputUuid");
+    expect(JSON.stringify(observed)).not.toMatch(/display_uuid|application|device/);
+    expect(result.targets).toContainEqual(expect.objectContaining({
+      availability: "available",
+      label: "[Bitwig Studio] Project",
+    }));
   });
 });
 

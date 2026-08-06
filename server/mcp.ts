@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+import { readCaptureTargets } from "./capture-targets.js";
 import { ConfigError, loadObsConfig, type ObsConfig, type SidecarConfig } from "./config.js";
 import { classifyObsFailure, readObsStatus, type ObsSocketFactory } from "./obs.js";
 
@@ -53,23 +54,81 @@ export function createMcpServer(
     },
   );
 
+  server.registerTool(
+    "list_capture_targets",
+    {
+      title: "List OBS capture targets",
+      description:
+        "List configured OBS capture inputs and currently selectable macOS windows, with explicit limitations for target kinds this OBS build cannot enumerate safely. This performs no OBS mutations.",
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async (extra) => {
+      try {
+        const discovery = await readCaptureTargets(await loadObs(), createSocket, { signal: extra.signal });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ server: SERVER_INFO, status: "ok", ...discovery }),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                server: SERVER_INFO,
+                status: "unavailable",
+                reason: curatedCaptureTargetFailureReason(error),
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
   return server;
 }
 
+export function curatedCaptureTargetFailureReason(error: unknown): string {
+  return curatedObsFailureReason(error, {
+    cancelled: "OBS capture target discovery was cancelled.",
+    timeout: "OBS capture target discovery timed out.",
+    unknown: "OBS capture target discovery failed for an unknown reason.",
+  });
+}
+
 export function curatedFailureReason(error: unknown): string {
+  return curatedObsFailureReason(error, {
+    cancelled: "OBS preflight was cancelled.",
+    timeout: "OBS preflight timed out.",
+    unknown: "OBS preflight failed for an unknown reason.",
+  });
+}
+
+function curatedObsFailureReason(
+  error: unknown,
+  messages: { cancelled: string; timeout: string; unknown: string },
+): string {
   if (error instanceof ConfigError) return "OBS configuration is unavailable.";
   switch (classifyObsFailure(error)) {
     case "authentication_failed":
       return "OBS authentication failed.";
     case "cancelled":
-      return "OBS preflight was cancelled.";
+      return messages.cancelled;
     case "incompatible_protocol":
       return "OBS WebSocket protocol is incompatible.";
     case "obs_unavailable":
       return "OBS is unavailable or refused the connection.";
     case "timeout":
-      return "OBS preflight timed out.";
+      return messages.timeout;
     case "unknown":
-      return "OBS preflight failed for an unknown reason.";
+      return messages.unknown;
   }
 }

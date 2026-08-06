@@ -18,10 +18,21 @@ reference and regression evidence; it is not deleted as part of the
 migration. FFmpeg is no longer in the capture path. `ffprobe` may remain an
 optional, best-effort post-recording validator where it adds useful evidence.
 
-The initial TypeScript server is intentionally read-only. Its first useful tool
-is `get_status`, limited to the OBS/version, screen-capture capability, and
-Source Record filter capability checks. Recording state and output reporting
-remain later status evolution, after recording controls exist.
+The TypeScript server is intentionally read-only at this stage. `get_status`
+reports OBS/version, screen-capture capability, and Source Record filter
+capability. `list_capture_targets` reports configured capture inputs and the
+currently selectable windows without changing OBS. It also reports explicit
+limitations for display, application, and camera lists that this OBS build
+cannot safely expose over WebSocket; already-configured selections remain
+visible when OBS reports their explicit target identifiers. Recording state
+and output reporting remain later status evolution, after recording controls
+exist.
+
+On OBS 32.2.1 for macOS, `GetInputPropertiesListPropertyItems` can crash OBS
+when called with only an input UUID, or when obs-websocket serializes some
+dynamic string-valued capture lists. Scenecap therefore sends the current
+input name, permits only the verified integer-valued `window` property, and
+reports other dynamic lists as unavailable rather than probing them.
 
 ## Target architecture
 
@@ -56,8 +67,10 @@ packaging.
 ## Setup and initial use
 
 Prerequisites: Node.js 22 or later, pnpm 10, and a running local OBS instance
-with WebSocket authentication enabled. Install and configure OBS Source Record
-when you need isolated source files; the initial capability check reports
+with WebSocket authentication enabled. Configure OBS WebSocket to listen only
+on loopback; scenecap always connects to `127.0.0.1`, but it cannot constrain
+the address on which OBS itself listens. Install and configure OBS Source
+Record when you need isolated source files; the capability check reports
 whether its filter is available.
 
 ```sh
@@ -119,18 +132,18 @@ use the repository's installed MCP SDK client from another:
 pnpm run smoke
 ```
 
-The command connects over Streamable HTTP, lists tools, calls `get_status`, and
-prints both responses. It does not mutate OBS.
+The command connects over Streamable HTTP, lists tools, calls `get_status` and
+`list_capture_targets`, and prints the responses. It does not mutate OBS.
 
 Skills remain deliberately deferred until real sessions using these tools
 establish a stable workflow worth packaging.
 
 ## Planned tools
 
-After `get_status` is proven, the server will add narrow tools rather than a
-generic OBS passthrough:
+The server will continue adding narrow tools rather than a generic OBS
+passthrough:
 
-- `list_capture_targets` and `preview_capture_target`
+- `preview_capture_target`
 - `configure_session` and `get_session`
 - `start_recording` and `stop_recording`
 - `restore_obs_state`
@@ -143,10 +156,11 @@ when an OBS source has an odd or otherwise unsupported size.
 
 ## Safety boundaries
 
-- Both OBS WebSocket and the MCP sidecar bind to loopback only; neither is a
-  network-exposed remote-control service.
-- `get_status` and preflight inspection are read-only. Starting, stopping, or
-  changing OBS state is explicit and observable.
+- The MCP sidecar binds to loopback only and connects only to OBS at
+  `127.0.0.1`. OBS WebSocket must be configured separately to avoid exposing
+  its remote-control listener on the network.
+- `get_status` and `list_capture_targets` are read-only. Starting, stopping,
+  or changing OBS state is explicit and observable.
 - Future mutation tools will snapshot temporary OBS state before changing it
   and restore it on request or safe cleanup.
 - Future recording tools will report the final output path and, when

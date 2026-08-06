@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ConfigError, type SidecarConfig } from "../server/config.js";
 import { McpHttpSidecar, type McpHttpSidecarOptions } from "../server/http.js";
 import { createMcpServer } from "../server/mcp.js";
-import type { ObsConnectionOptions, ObsSocket } from "../server/obs.js";
+import type { ObsConnectionOptions, ObsReadRequest, ObsSocket } from "../server/obs.js";
 
 class FakeObsSocket implements ObsSocket {
   connectedWith?: ObsConnectionOptions;
@@ -17,10 +17,14 @@ class FakeObsSocket implements ObsSocket {
     this.connectedWith = options;
   }
 
-  async call(requestType: "GetVersion" | "GetInputKindList" | "GetSourceFilterKindList"): Promise<unknown> {
-    if (requestType === "GetVersion") return { obsVersion: "31.0.0" };
-    if (requestType === "GetInputKindList") return { inputKinds: ["screen"] };
-    return { sourceFilterKinds: ["crop", "source_record_filter"] };
+  async request(request: ObsReadRequest): Promise<unknown> {
+    if (request.type === "GetVersion") return { obsVersion: "31.0.0" };
+    if (request.type === "GetInputKindList") return { inputKinds: ["screen"] };
+    if (request.type === "GetSourceFilterKindList") {
+      return { sourceFilterKinds: ["crop", "source_record_filter"] };
+    }
+    if (request.type === "GetInputList") return { inputs: [] };
+    throw new Error(`Unexpected fake OBS request: ${request.type}`);
   }
 
   disconnect(): void {}
@@ -43,7 +47,7 @@ describe("MCP HTTP sidecar", () => {
     const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
     await client.connect(transport);
     const tools = await client.listTools();
-    expect(tools.tools.map((tool) => tool.name)).toEqual(["get_status"]);
+    expect(tools.tools.map((tool) => tool.name)).toEqual(["get_status", "list_capture_targets"]);
 
     const result = await client.callTool({ name: "get_status", arguments: {} });
     expect(result.isError).not.toBe(true);
@@ -54,6 +58,25 @@ describe("MCP HTTP sidecar", () => {
     expect(status.server).toEqual({ name: "scenecap", version: "0.1.0" });
     expect(status.capabilities).toEqual({ screen_capture: false, source_record_filter: true });
     expect(socket.connectedWith?.password).toBe("integration-secret");
+    const discoveryResult = await client.callTool({ name: "list_capture_targets", arguments: {} }) as {
+      content?: Array<{ text?: string; type: string }>;
+      isError?: boolean;
+    };
+    expect(discoveryResult.isError).not.toBe(true);
+    expect(JSON.stringify(discoveryResult)).not.toContain("integration-secret");
+    const discoveryContent = discoveryResult.content?.[0];
+    expect(discoveryContent).toMatchObject({ type: "text" });
+    if (!discoveryContent || discoveryContent.type !== "text") {
+      throw new Error("Expected capture discovery to return text.");
+    }
+    expect(JSON.parse(discoveryContent.text ?? "{}")).toMatchObject({
+      limitations: [
+        expect.objectContaining({ kind: "screen_capture" }),
+        expect.objectContaining({ kind: "camera" }),
+      ],
+      status: "ok",
+      targets: [],
+    });
     await client.close();
   });
 
@@ -135,8 +158,8 @@ describe("MCP HTTP sidecar", () => {
       second.connect(new StreamableHTTPClientTransport(endpoint)),
     ]);
     await expect(Promise.all([first.listTools(), second.listTools()])).resolves.toEqual([
-      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
-      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
+      expect.objectContaining({ tools: expect.arrayContaining([expect.objectContaining({ name: "get_status" })]) }),
+      expect.objectContaining({ tools: expect.arrayContaining([expect.objectContaining({ name: "get_status" })]) }),
     ]);
     await Promise.all([first.close(), second.close()]);
   });
@@ -246,7 +269,7 @@ describe("MCP HTTP sidecar", () => {
       status: "unavailable",
     });
     await expect(client.listTools()).resolves.toEqual(
-      expect.objectContaining({ tools: [expect.objectContaining({ name: "get_status" })] }),
+      expect.objectContaining({ tools: expect.arrayContaining([expect.objectContaining({ name: "get_status" })]) }),
     );
     await client.close();
   });
@@ -258,7 +281,7 @@ describe("MCP HTTP sidecar", () => {
         async connect() {
           throw new Error(`Authentication failed for ${secret}`);
         },
-        async call() {
+        async request() {
           throw new Error("unreachable");
         },
         disconnect() {},
