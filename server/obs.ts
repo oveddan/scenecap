@@ -104,12 +104,12 @@ export async function readObsStatus(
   createSocket: ObsSocketFactory = createObsSocket,
   optionsOrSignal: ObsReadOptions | AbortSignal = {},
 ): Promise<ObsStatus> {
-  const options = normalizeOptions(optionsOrSignal);
+  const options = normalizeObsReadOptions(optionsOrSignal);
   const deadline = Date.now() + options.timeoutMs;
   throwIfAborted(options.signal);
   const socket = createSocket();
   try {
-    await bounded(socket, () => socket.connect({
+    await boundedObsRead(socket, () => socket.connect({
       // The destination is constructed from validated numeric loopback data.
       // No proxy URL, redirect URL, or caller-provided endpoint can enter this
       // adapter; the WebSocket connection is therefore a direct local handshake.
@@ -119,9 +119,14 @@ export async function readObsStatus(
     }), options, deadline);
 
     // This foundation intentionally makes only read-only capability calls.
-    const version = await bounded(socket, () => socket.request({ type: "GetVersion" }), options, deadline);
-    const inputKinds = await bounded(socket, () => socket.request({ type: "GetInputKindList" }), options, deadline);
-    const sourceFilterKinds = await bounded(
+    const version = await boundedObsRead(socket, () => socket.request({ type: "GetVersion" }), options, deadline);
+    const inputKinds = await boundedObsRead(
+      socket,
+      () => socket.request({ type: "GetInputKindList" }),
+      options,
+      deadline,
+    );
+    const sourceFilterKinds = await boundedObsRead(
       socket,
       () => socket.request({ type: "GetSourceFilterKindList" }),
       options,
@@ -139,7 +144,7 @@ export async function readObsStatus(
       websocketVersion: optionalString(version, "obsWebSocketVersion"),
     };
   } finally {
-    disconnectQuietly(socket);
+    disconnectObsQuietly(socket);
   }
 }
 
@@ -159,7 +164,9 @@ export function classifyObsFailure(error: unknown): ObsFailureKind {
   if (code === 4010 || /unsupported protocol|invalid subprotocol|rpc version|incompatible protocol/.test(message)) {
     return "incompatible_protocol";
   }
-  if (/econnrefused|econnreset|enotfound|connection refused|unexpected server response/.test(message)) {
+  if (
+    /econnrefused|econnreset|enotfound|connection refused|not connected|socket not identified|unexpected server response/.test(message)
+  ) {
     return "obs_unavailable";
   }
   return "unknown";
@@ -172,7 +179,7 @@ export async function boundedObsRead<T>(
   deadline: number,
 ): Promise<T> {
   if (options.signal.aborted) {
-    disconnectQuietly(socket);
+    disconnectObsQuietly(socket);
     throw new ObsStatusError("cancelled");
   }
   let timeout: NodeJS.Timeout | undefined;
@@ -186,15 +193,13 @@ export async function boundedObsRead<T>(
   try {
     return await Promise.race([operation(), interrupted]);
   } catch (error) {
-    if (error instanceof ObsStatusError) disconnectQuietly(socket);
+    if (error instanceof ObsStatusError) disconnectObsQuietly(socket);
     throw error;
   } finally {
     if (timeout) clearTimeout(timeout);
     options.signal.removeEventListener("abort", onAbort);
   }
 }
-
-const bounded = boundedObsRead;
 
 export function normalizeObsReadOptions(
   optionsOrSignal: ObsReadOptions | AbortSignal,
@@ -206,8 +211,6 @@ export function normalizeObsReadOptions(
   };
 }
 
-const normalizeOptions = normalizeObsReadOptions;
-
 export function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
   return "aborted" in value && "addEventListener" in value;
 }
@@ -215,8 +218,6 @@ export function isAbortSignal(value: ObsReadOptions | AbortSignal): value is Abo
 export function disconnectObsQuietly(socket: ObsSocket): void {
   void Promise.resolve(socket.disconnect()).catch(() => undefined);
 }
-
-const disconnectQuietly = disconnectObsQuietly;
 
 function optionalString(value: unknown, key: string): string | undefined {
   if (value === null || typeof value !== "object") {

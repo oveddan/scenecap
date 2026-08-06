@@ -168,8 +168,7 @@ export async function readCaptureTargets(
     }
 
     const targets = snapshots.flatMap(toConfiguredCaptureTarget);
-    if (screenInputs.length > 0) {
-      const probeInput = preferredScreenProbe(screenInputs);
+    for (const probeInput of representativeScreenProbes(screenInputs)) {
       try {
         targets.push(...await readPropertyTargets(
           socket,
@@ -278,12 +277,20 @@ function isSupportedCaptureInput(input: ObsInput): boolean {
   return input.inputKind === "screen_capture" || CAMERA_INPUT_KINDS.has(input.inputKind);
 }
 
-function preferredScreenProbe(inputs: InputSnapshot[]): InputSnapshot {
-  return [...inputs].sort((left, right) => {
-    const leftBroad = left.settings.show_hidden_windows === true || left.settings.show_empty_names === true;
-    const rightBroad = right.settings.show_hidden_windows === true || right.settings.show_empty_names === true;
-    return Number(rightBroad) - Number(leftBroad) || left.inputName.localeCompare(right.inputName);
-  })[0] as InputSnapshot;
+function representativeScreenProbes(inputs: InputSnapshot[]): InputSnapshot[] {
+  const representatives = new Map<string, InputSnapshot>();
+  for (const input of [...inputs].sort((left, right) => left.inputName.localeCompare(right.inputName))) {
+    const key = [
+      input.settings.show_hidden_windows === true,
+      input.settings.show_empty_names === true,
+    ].join(":");
+    if (!representatives.has(key)) representatives.set(key, input);
+  }
+  return [...representatives.values()].sort((left, right) => {
+    const breadth = (input: InputSnapshot) =>
+      Number(input.settings.show_hidden_windows === true) + Number(input.settings.show_empty_names === true);
+    return breadth(right) - breadth(left) || left.inputName.localeCompare(right.inputName);
+  });
 }
 
 function toCaptureSource(input: InputSnapshot): CaptureSource {
@@ -291,7 +298,7 @@ function toCaptureSource(input: InputSnapshot): CaptureSource {
   return {
     ...(configured ? { configuredTargetRef: encodeCaptureTargetRef(configured.kind, configured.value) } : {}),
     inputKind: input.inputKind,
-    inputName: input.inputName,
+    inputName: cleanLabel(input.inputName) ?? "Unnamed capture input",
     sourceRef: encodeInputRef(input.inputUuid),
   };
 }
@@ -300,9 +307,10 @@ function toConfiguredCaptureTarget(input: InputSnapshot): CaptureTarget[] {
   const configured = configuredTarget(input);
   if (!configured) return [];
   const deviceName = input.settings.device_name;
+  const inputName = cleanLabel(input.inputName) ?? "Unnamed capture input";
   const label = configured.kind === "camera" && typeof deviceName === "string" && deviceName.trim()
-    ? deviceName.trim().slice(0, 300)
-    : `${input.inputName} (configured ${configured.kind})`;
+    ? cleanLabel(deviceName) ?? inputName
+    : `${inputName} (configured ${configured.kind})`.slice(0, 300);
   return [{
     availability: "configured_only",
     kind: configured.kind,

@@ -211,6 +211,64 @@ describe("readCaptureTargets", () => {
     expect(disconnected).toBe(true);
   });
 
+  it("times out and disconnects during a hanging discovery request", async () => {
+    let disconnected = false;
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "uuid" }] };
+        }
+        return new Promise<never>(() => undefined);
+      },
+      disconnect() {
+        disconnected = true;
+      },
+    };
+
+    await expect(readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+      { timeoutMs: 10 },
+    )).rejects.toMatchObject({ kind: "timeout" });
+    expect(disconnected).toBe(true);
+  });
+
+  it("uses one timeout budget across cumulative discovery requests", async () => {
+    const requests: string[] = [];
+    let disconnected = false;
+    const socket: ObsSocket = {
+      async connect() {
+        await delay(10);
+      },
+      async request(request) {
+        requests.push(request.type);
+        await delay(10);
+        if (request.type === "GetInputList") {
+          return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "uuid" }] };
+        }
+        if (request.type === "GetInputSettings") return { inputSettings: { type: 1 } };
+        if (request.type === "GetInputPropertiesListPropertyItems") return { propertyItems: [] };
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {
+        disconnected = true;
+      },
+    };
+
+    await expect(readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+      { timeoutMs: 35 },
+    )).rejects.toMatchObject({ kind: "timeout" });
+    expect(requests).toEqual([
+      "GetInputList",
+      "GetInputSettings",
+      "GetInputPropertiesListPropertyItems",
+    ]);
+    expect(disconnected).toBe(true);
+  });
+
   it("bounds large OBS window lists and reports truncation", async () => {
     const socket: ObsSocket = {
       async connect() {},
@@ -251,14 +309,18 @@ describe("readCaptureTargets", () => {
         inputName: `Screen ${index + 1}`,
         inputUuid: `screen-${index + 1}`,
       })),
-      { inputKind: "macos-avcapture", inputName: "Camera", inputUuid: "camera" },
+      ...Array.from({ length: 9 }, (_, index) => ({
+        inputKind: "macos-avcapture",
+        inputName: `Camera ${index + 1}`,
+        inputUuid: `camera-${index + 1}`,
+      })),
     ];
     const socket: ObsSocket = {
       async connect() {},
       async request(request) {
         if (request.type === "GetInputList") return { inputs };
         if (request.type === "GetInputSettings") {
-          return request.data.inputName === "Camera"
+          return request.data.inputName.startsWith("Camera ")
             ? { inputSettings: { device: "camera-id" } }
             : { inputSettings: { type: 1 } };
         }
@@ -273,14 +335,75 @@ describe("readCaptureTargets", () => {
       () => socket,
     );
 
-    expect(result.sources).toHaveLength(9);
+    expect(result.sources).toHaveLength(16);
     expect(result.sources.some((source) => source.inputKind === "macos-avcapture")).toBe(true);
     expect(result.limitations).toContainEqual(
       expect.objectContaining({ code: "input_limit_reached", kind: "screen_capture" }),
     );
+    expect(result.limitations).toContainEqual(
+      expect.objectContaining({ code: "input_limit_reached", kind: "camera" }),
+    );
     expect(result.limitations).not.toContainEqual(
       expect.objectContaining({ code: "requires_existing_input", kind: "camera" }),
     );
+  });
+
+  it("unions distinct window-list configurations and continues after a stale broad probe", async () => {
+    const propertyProbeNames: string[] = [];
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return {
+            inputs: [
+              { inputKind: "screen_capture", inputName: "Hidden Only", inputUuid: "hidden" },
+              { inputKind: "screen_capture", inputName: "Empty Only", inputUuid: "empty" },
+              { inputKind: "screen_capture", inputName: "Zulu Broad", inputUuid: "broad" },
+            ],
+          };
+        }
+        if (request.type === "GetInputSettings") {
+          if (request.data.inputName === "Hidden Only") {
+            return { inputSettings: { show_hidden_windows: true, type: 1 } };
+          }
+          if (request.data.inputName === "Empty Only") {
+            return { inputSettings: { show_empty_names: true, type: 1 } };
+          }
+          return { inputSettings: { show_empty_names: true, show_hidden_windows: true, type: 1 } };
+        }
+        if (request.type === "GetInputPropertiesListPropertyItems") {
+          propertyProbeNames.push(request.data.inputName);
+          if (request.data.inputName === "Zulu Broad") {
+            throw Object.assign(new Error("resource changed"), { code: 601 });
+          }
+          return {
+            propertyItems: [{
+              itemEnabled: true,
+              itemName: `${request.data.inputName} Window`,
+              itemValue: request.data.inputName === "Hidden Only" ? 10 : 20,
+            }],
+          };
+        }
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {},
+    };
+
+    const result = await readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+    );
+
+    expect(propertyProbeNames).toEqual(["Zulu Broad", "Empty Only", "Hidden Only"]);
+    expect(result.targets.map((target) => target.label)).toEqual([
+      "Empty Only Window",
+      "Hidden Only Window",
+    ]);
+    expect(result.limitations).toContainEqual(expect.objectContaining({
+      code: "input_unavailable",
+      inputName: "Zulu Broad",
+      kind: "window",
+    }));
   });
 
   it("reports explicit display and application selections, including the default display mode", async () => {
@@ -359,4 +482,30 @@ describe("readCaptureTargets", () => {
     }));
     expect(result.targets).toContainEqual(expect.objectContaining({ label: "Remaining Window" }));
   });
+
+  it("treats a mid-discovery socket loss as fatal OBS unavailability", async () => {
+    let disconnected = false;
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "uuid" }] };
+        }
+        throw new Error("Not connected");
+      },
+      disconnect() {
+        disconnected = true;
+      },
+    };
+
+    await expect(readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+    )).rejects.toThrow("Not connected");
+    expect(disconnected).toBe(true);
+  });
 });
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
