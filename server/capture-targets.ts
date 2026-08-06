@@ -1,8 +1,10 @@
 import type { ObsConfig } from "./config.js";
 import {
   boundedObsRead,
+  classifyObsFailure,
   createObsSocket,
   disconnectObsQuietly,
+  isAbortSignal,
   normalizeObsReadOptions,
   type CapturePropertyName,
   type ObsReadOptions,
@@ -10,7 +12,7 @@ import {
   type ObsSocketFactory,
 } from "./obs.js";
 
-const MAX_CAPTURE_INPUTS = 16;
+const MAX_CAPTURE_INPUTS_PER_KIND = 8;
 const MAX_TARGETS_PER_KIND = 250;
 export const DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS = 20_000;
 
@@ -32,7 +34,12 @@ export interface CaptureTarget {
 }
 
 export interface CaptureTargetLimitation {
-  code: "dynamic_list_unavailable" | "input_limit_reached" | "requires_existing_input";
+  code:
+    | "dynamic_list_unavailable"
+    | "input_limit_reached"
+    | "input_unavailable"
+    | "requires_existing_input";
+  inputName?: string;
   kind?: CaptureTargetKind | "screen_capture";
   message: string;
 }
@@ -68,10 +75,13 @@ export async function readCaptureTargets(
   createSocket: ObsSocketFactory = createObsSocket,
   optionsOrSignal: ObsReadOptions | AbortSignal = {},
 ): Promise<CaptureTargetDiscovery> {
+  const timeoutMs = isAbortSignal(optionsOrSignal)
+    ? DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS
+    : optionsOrSignal.timeoutMs ?? DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS;
   const options = normalizeObsReadOptions(
     isAbortSignal(optionsOrSignal)
-      ? { signal: optionsOrSignal, timeoutMs: DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS }
-      : { timeoutMs: DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS, ...optionsOrSignal },
+      ? { signal: optionsOrSignal, timeoutMs }
+      : { ...optionsOrSignal, timeoutMs },
   );
   const deadline = Date.now() + options.timeoutMs;
   const socket = createSocket();
@@ -93,21 +103,37 @@ export async function readCaptureTargets(
       options,
       deadline,
     );
-    const allCaptureInputs = parseInputs(inputResponse).filter(isSupportedCaptureInput);
-    const inputs = allCaptureInputs.slice(0, MAX_CAPTURE_INPUTS);
-    const snapshots = await readSnapshots(socket, inputs, options, deadline);
-
     const limitations: CaptureTargetLimitation[] = [];
-    if (allCaptureInputs.length > inputs.length) {
+    const allCaptureInputs = parseInputs(inputResponse).filter(isSupportedCaptureInput);
+    const allScreenInputs = allCaptureInputs.filter((input) => input.inputKind === "screen_capture");
+    const allCameraInputs = allCaptureInputs.filter((input) => CAMERA_INPUT_KINDS.has(input.inputKind));
+    const selectedScreenInputs = allScreenInputs.slice(0, MAX_CAPTURE_INPUTS_PER_KIND);
+    const selectedCameraInputs = allCameraInputs.slice(0, MAX_CAPTURE_INPUTS_PER_KIND);
+    if (allScreenInputs.length > selectedScreenInputs.length) {
       limitations.push({
         code: "input_limit_reached",
-        message: `Only the first ${MAX_CAPTURE_INPUTS} supported OBS capture inputs were inspected.`,
+        kind: "screen_capture",
+        message: `Only the first ${MAX_CAPTURE_INPUTS_PER_KIND} macOS Screen Capture inputs were inspected.`,
+      });
+    }
+    if (allCameraInputs.length > selectedCameraInputs.length) {
+      limitations.push({
+        code: "input_limit_reached",
+        kind: "camera",
+        message: `Only the first ${MAX_CAPTURE_INPUTS_PER_KIND} Video Capture Device inputs were inspected.`,
       });
     }
 
+    const snapshots = await readSnapshots(
+      socket,
+      [...selectedScreenInputs, ...selectedCameraInputs],
+      options,
+      deadline,
+      limitations,
+    );
+
     const screenInputs = snapshots.filter((input) => input.inputKind === "screen_capture");
-    const cameraInputs = snapshots.filter((input) => CAMERA_INPUT_KINDS.has(input.inputKind));
-    if (screenInputs.length === 0) {
+    if (allScreenInputs.length === 0) {
       limitations.push({
         code: "requires_existing_input",
         kind: "screen_capture",
@@ -118,16 +144,16 @@ export async function readCaptureTargets(
         {
           code: "dynamic_list_unavailable",
           kind: "display",
-          message: "Available displays cannot be queried safely through this OBS WebSocket build; configured display sources are still reported.",
+          message: "Available displays cannot be queried safely through this OBS WebSocket build; explicit configured display selections are still reported.",
         },
         {
           code: "dynamic_list_unavailable",
           kind: "application",
-          message: "Available applications cannot be queried safely through this OBS WebSocket build; configured application sources are still reported.",
+          message: "Available applications cannot be queried safely through this OBS WebSocket build; explicit configured application selections are still reported.",
         },
       );
     }
-    if (cameraInputs.length === 0) {
+    if (allCameraInputs.length === 0) {
       limitations.push({
         code: "requires_existing_input",
         kind: "camera",
@@ -137,23 +163,32 @@ export async function readCaptureTargets(
       limitations.push({
         code: "dynamic_list_unavailable",
         kind: "camera",
-        message: "Available cameras cannot yet be queried safely through this OBS WebSocket build; configured camera sources are still reported.",
+        message: "Available cameras cannot yet be queried safely through this OBS WebSocket build; explicit configured camera selections are still reported.",
       });
     }
 
-    const targets: CaptureTarget[] = [];
+    const targets = snapshots.flatMap(toConfiguredCaptureTarget);
     if (screenInputs.length > 0) {
       const probeInput = preferredScreenProbe(screenInputs);
-      targets.push(...await readPropertyTargets(
-        socket,
-        probeInput,
-        WINDOW_PROBE,
-        options,
-        deadline,
-      ));
+      try {
+        targets.push(...await readPropertyTargets(
+          socket,
+          probeInput,
+          WINDOW_PROBE,
+          options,
+          deadline,
+        ));
+      } catch (error) {
+        if (classifyObsFailure(error) !== "unknown") throw error;
+        const inputName = cleanLabel(probeInput.inputName) ?? "Unnamed capture input";
+        limitations.push({
+          code: "input_unavailable",
+          inputName,
+          kind: "window",
+          message: `OBS input '${inputName}' changed or became unavailable while listing windows.`,
+        });
+      }
     }
-    targets.push(...snapshots.flatMap(toConfiguredCaptureTarget));
-
     const { boundedTargets, truncatedKinds } = boundAndDedupeTargets(targets);
     return {
       limitations,
@@ -171,16 +206,28 @@ async function readSnapshots(
   inputs: ObsInput[],
   options: Required<ObsReadOptions>,
   deadline: number,
+  limitations: CaptureTargetLimitation[],
 ): Promise<InputSnapshot[]> {
   const snapshots: InputSnapshot[] = [];
   for (const input of inputs) {
-    const response = await boundedObsRead(
-      socket,
-      () => socket.request({ data: { inputName: input.inputName }, type: "GetInputSettings" }),
-      options,
-      deadline,
-    );
-    snapshots.push({ ...input, settings: objectField(response, "inputSettings") });
+    try {
+      const response = await boundedObsRead(
+        socket,
+        () => socket.request({ data: { inputName: input.inputName }, type: "GetInputSettings" }),
+        options,
+        deadline,
+      );
+      snapshots.push({ ...input, settings: objectField(response, "inputSettings") });
+    } catch (error) {
+      if (classifyObsFailure(error) !== "unknown") throw error;
+      const inputName = cleanLabel(input.inputName) ?? "Unnamed capture input";
+      limitations.push({
+        code: "input_unavailable",
+        inputName,
+        kind: input.inputKind === "screen_capture" ? "screen_capture" : "camera",
+        message: `OBS input '${inputName}' changed or became unavailable during discovery and was skipped.`,
+      });
+    }
   }
   return snapshots;
 }
@@ -269,7 +316,7 @@ function configuredTarget(
   input: InputSnapshot,
 ): { kind: CaptureTargetKind; value: number | string } | undefined {
   if (input.inputKind === "screen_capture") {
-    const captureType = input.settings.type;
+    const captureType = input.settings.type === undefined ? 0 : input.settings.type;
     const selection = captureType === 0
       ? { kind: "display" as const, value: targetValue(input.settings.display_uuid) }
       : captureType === 1
@@ -293,11 +340,18 @@ function boundAndDedupeTargets(targets: CaptureTarget[]): {
   truncatedKinds: CaptureTargetKind[];
 } {
   const seen = new Set<string>();
+  const targetIndexes = new Map<string, number>();
   const counts = new Map<CaptureTargetKind, number>();
   const truncatedKinds = new Set<CaptureTargetKind>();
   const boundedTargets: CaptureTarget[] = [];
   for (const target of targets) {
-    if (seen.has(target.targetRef)) continue;
+    if (seen.has(target.targetRef)) {
+      const existingIndex = targetIndexes.get(target.targetRef);
+      if (existingIndex !== undefined && target.availability === "available") {
+        boundedTargets[existingIndex] = target;
+      }
+      continue;
+    }
     seen.add(target.targetRef);
     const count = counts.get(target.kind) ?? 0;
     if (count >= MAX_TARGETS_PER_KIND) {
@@ -305,6 +359,7 @@ function boundAndDedupeTargets(targets: CaptureTarget[]): {
       continue;
     }
     counts.set(target.kind, count + 1);
+    targetIndexes.set(target.targetRef, boundedTargets.length);
     boundedTargets.push(target);
   }
   return { boundedTargets, truncatedKinds: [...truncatedKinds] };
@@ -350,8 +405,4 @@ function arrayField(value: unknown, key: string): unknown[] {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
-  return "aborted" in value && "addEventListener" in value;
 }

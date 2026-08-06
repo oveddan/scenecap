@@ -97,37 +97,38 @@ export function createMcpServer(
 }
 
 export function curatedCaptureTargetFailureReason(error: unknown): string {
-  if (error instanceof ConfigError) return "OBS configuration is unavailable.";
-  switch (classifyObsFailure(error)) {
-    case "authentication_failed":
-      return "OBS authentication failed.";
-    case "cancelled":
-      return "OBS capture target discovery was cancelled.";
-    case "incompatible_protocol":
-      return "OBS WebSocket protocol is incompatible.";
-    case "obs_unavailable":
-      return "OBS is unavailable or refused the connection.";
-    case "timeout":
-      return "OBS capture target discovery timed out.";
-    case "unknown":
-      return "OBS capture target discovery failed for an unknown reason.";
-  }
+  return curatedObsFailureReason(error, {
+    cancelled: "OBS capture target discovery was cancelled.",
+    timeout: "OBS capture target discovery timed out.",
+    unknown: "OBS capture target discovery failed for an unknown reason.",
+  });
 }
 
 export function curatedFailureReason(error: unknown): string {
+  return curatedObsFailureReason(error, {
+    cancelled: "OBS preflight was cancelled.",
+    timeout: "OBS preflight timed out.",
+    unknown: "OBS preflight failed for an unknown reason.",
+  });
+}
+
+function curatedObsFailureReason(
+  error: unknown,
+  messages: { cancelled: string; timeout: string; unknown: string },
+): string {
   if (error instanceof ConfigError) return "OBS configuration is unavailable.";
   switch (classifyObsFailure(error)) {
     case "authentication_failed":
       return "OBS authentication failed.";
     case "cancelled":
-      return "OBS preflight was cancelled.";
+      return messages.cancelled;
     case "incompatible_protocol":
       return "OBS WebSocket protocol is incompatible.";
     case "obs_unavailable":
       return "OBS is unavailable or refused the connection.";
     case "timeout":
-      return "OBS preflight timed out.";
+      return messages.timeout;
     case "unknown":
-      return "OBS preflight failed for an unknown reason.";
+      return messages.unknown;
   }
 }

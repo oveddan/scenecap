@@ -208,7 +208,7 @@ export function normalizeObsReadOptions(
 
 const normalizeOptions = normalizeObsReadOptions;
 
-function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
+export function isAbortSignal(value: ObsReadOptions | AbortSignal): value is AbortSignal {
   return "aborted" in value && "addEventListener" in value;
 }
 

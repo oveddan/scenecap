@@ -24,8 +24,9 @@ capability. `list_capture_targets` reports configured capture inputs and the
 currently selectable windows without changing OBS. It also reports explicit
 limitations for display, application, and camera lists that this OBS build
 cannot safely expose over WebSocket; already-configured selections remain
-visible. Recording state and output reporting remain later status evolution,
-after recording controls exist.
+visible when OBS reports their explicit target identifiers. Recording state
+and output reporting remain later status evolution, after recording controls
+exist.
 
 On OBS 32.2.1 for macOS, `GetInputPropertiesListPropertyItems` can crash OBS
 when called with only an input UUID, or when obs-websocket serializes some

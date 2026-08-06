@@ -176,6 +176,41 @@ describe("readCaptureTargets", () => {
     expect(socket.disconnected).toBe(true);
   });
 
+  it("honours cancellation during capture-input inspection", async () => {
+    let startSettingsRequest!: () => void;
+    const settingsRequestStarted = new Promise<void>((resolve) => {
+      startSettingsRequest = resolve;
+    });
+    let disconnected = false;
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "uuid" }] };
+        }
+        if (request.type === "GetInputSettings") {
+          startSettingsRequest();
+          return new Promise<never>(() => undefined);
+        }
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {
+        disconnected = true;
+      },
+    };
+    const controller = new AbortController();
+    const pending = readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+      controller.signal,
+    );
+    await settingsRequestStarted;
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ kind: "cancelled" });
+    expect(disconnected).toBe(true);
+  });
+
   it("bounds large OBS window lists and reports truncation", async () => {
     const socket: ObsSocket = {
       async connect() {},
@@ -183,7 +218,7 @@ describe("readCaptureTargets", () => {
         if (request.type === "GetInputList") {
           return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "uuid" }] };
         }
-        if (request.type === "GetInputSettings") return { inputSettings: { type: 1 } };
+        if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 251 } };
         if (request.type === "GetInputPropertiesListPropertyItems") {
           return {
             propertyItems: Array.from({ length: 251 }, (_, index) => ({
@@ -205,5 +240,123 @@ describe("readCaptureTargets", () => {
 
     expect(result.targets).toHaveLength(250);
     expect(result.truncatedKinds).toEqual(["window"]);
+    expect(result.targets.find((target) => target.targetRef === encodeCaptureTargetRef("window", 251)))
+      .toMatchObject({ availability: "available", label: "Window 251" });
+  });
+
+  it("caps screen and camera inputs independently", async () => {
+    const inputs = [
+      ...Array.from({ length: 9 }, (_, index) => ({
+        inputKind: "screen_capture",
+        inputName: `Screen ${index + 1}`,
+        inputUuid: `screen-${index + 1}`,
+      })),
+      { inputKind: "macos-avcapture", inputName: "Camera", inputUuid: "camera" },
+    ];
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") return { inputs };
+        if (request.type === "GetInputSettings") {
+          return request.data.inputName === "Camera"
+            ? { inputSettings: { device: "camera-id" } }
+            : { inputSettings: { type: 1 } };
+        }
+        if (request.type === "GetInputPropertiesListPropertyItems") return { propertyItems: [] };
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {},
+    };
+
+    const result = await readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+    );
+
+    expect(result.sources).toHaveLength(9);
+    expect(result.sources.some((source) => source.inputKind === "macos-avcapture")).toBe(true);
+    expect(result.limitations).toContainEqual(
+      expect.objectContaining({ code: "input_limit_reached", kind: "screen_capture" }),
+    );
+    expect(result.limitations).not.toContainEqual(
+      expect.objectContaining({ code: "requires_existing_input", kind: "camera" }),
+    );
+  });
+
+  it("reports explicit display and application selections, including the default display mode", async () => {
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return {
+            inputs: [
+              { inputKind: "screen_capture", inputName: "Display", inputUuid: "display-source" },
+              { inputKind: "screen_capture", inputName: "Application", inputUuid: "app-source" },
+            ],
+          };
+        }
+        if (request.type === "GetInputSettings") {
+          return request.data.inputName === "Display"
+            ? { inputSettings: { display_uuid: "display-id" } }
+            : { inputSettings: { application: "com.example.App", type: 2 } };
+        }
+        if (request.type === "GetInputPropertiesListPropertyItems") return { propertyItems: [] };
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {},
+    };
+
+    const result = await readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+    );
+
+    expect(result.targets).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "display",
+        targetRef: encodeCaptureTargetRef("display", "display-id"),
+      }),
+      expect.objectContaining({
+        kind: "application",
+        targetRef: encodeCaptureTargetRef("application", "com.example.App"),
+      }),
+    ]));
+  });
+
+  it("skips an input that disappears during discovery and keeps the remaining results", async () => {
+    const socket: ObsSocket = {
+      async connect() {},
+      async request(request) {
+        if (request.type === "GetInputList") {
+          return {
+            inputs: [
+              { inputKind: "screen_capture", inputName: "Removed", inputUuid: "removed" },
+              { inputKind: "screen_capture", inputName: "Remaining", inputUuid: "remaining" },
+            ],
+          };
+        }
+        if (request.type === "GetInputSettings" && request.data.inputName === "Removed") {
+          throw Object.assign(new Error("resource not found"), { code: 601 });
+        }
+        if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 7 } };
+        if (request.type === "GetInputPropertiesListPropertyItems") {
+          return { propertyItems: [{ itemEnabled: true, itemName: "Remaining Window", itemValue: 7 }] };
+        }
+        throw new Error(`Unexpected request: ${request.type}`);
+      },
+      disconnect() {},
+    };
+
+    const result = await readCaptureTargets(
+      { host: "127.0.0.1", password: "secret", port: 4455 },
+      () => socket,
+    );
+
+    expect(result.sources.map((source) => source.inputName)).toEqual(["Remaining"]);
+    expect(result.limitations).toContainEqual(expect.objectContaining({
+      code: "input_unavailable",
+      inputName: "Removed",
+    }));
+    expect(result.targets).toContainEqual(expect.objectContaining({ label: "Remaining Window" }));
   });
 });
