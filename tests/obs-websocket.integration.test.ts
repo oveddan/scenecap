@@ -5,7 +5,8 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer, type WebSocket } from "ws";
 
-import { readCaptureTargets } from "../server/capture-targets.js";
+import { previewCaptureTarget } from "../server/capture-preview.js";
+import { encodeCaptureTargetRef, readCaptureTargets } from "../server/capture-targets.js";
 import { classifyObsFailure, readObsStatus } from "../server/obs.js";
 
 const servers: Array<{ close(): Promise<void> }> = [];
@@ -159,6 +160,166 @@ describe("ObsWebSocketAdapter", () => {
       label: "[Bitwig Studio] Project",
     }));
   });
+
+  it("sends one bounded UUID screenshot request for a configured preview and never changes Program", async () => {
+    const observed: Array<{ connection: number; requestData?: unknown; requestType: string }> = [];
+    let connection = 0;
+    const fakeObs = await startObsServer((socket) => {
+      connection += 1;
+      const connectionNumber = connection;
+      socket.send(message(0, { obsWebSocketVersion: "5.5.0", rpcVersion: 1 }));
+      socket.on("message", (raw) => {
+        const incoming = JSON.parse(raw.toString()) as { d: Record<string, unknown>; op: number };
+        if (incoming.op === 1) {
+          socket.send(message(2, { negotiatedRpcVersion: 1 }));
+          return;
+        }
+        if (incoming.op !== 6 || typeof incoming.d.requestType !== "string") return;
+        const requestType = incoming.d.requestType;
+        observed.push({ connection: connectionNumber, requestData: incoming.d.requestData, requestType });
+        const responseData = connectionNumber === 1
+          ? requestType === "GetInputList"
+            ? { inputs: [{ inputKind: "screen_capture", inputName: "Capture", inputUuid: "input-uuid" }] }
+            : requestType === "GetInputSettings"
+              ? { inputSettings: { type: 1, window: 42 } }
+              : requestType === "GetInputPropertiesListPropertyItems"
+                ? { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] }
+                : undefined
+          : requestType === "GetSourceScreenshot"
+            ? { imageData: tinyJpegDataUrl() }
+            : undefined;
+        if (!responseData) throw new Error(`Unexpected OBS request: ${requestType}`);
+        socket.send(message(7, {
+          requestId: incoming.d.requestId,
+          requestStatus: { code: 100, result: true },
+          responseData,
+          requestType,
+        }));
+      });
+    });
+
+    const result = await previewCaptureTarget(
+      { host: "127.0.0.1", password: "unused-by-server", port: fakeObs.port },
+      encodeCaptureTargetRef("window", 42),
+    );
+
+    expect(result.previewMethod).toBe("configured_source");
+    expect(observed).toEqual([
+      { connection: 1, requestData: undefined, requestType: "GetInputList" },
+      { connection: 1, requestData: { inputName: "Capture" }, requestType: "GetInputSettings" },
+      {
+        connection: 1,
+        requestData: { inputName: "Capture", propertyName: "window" },
+        requestType: "GetInputPropertiesListPropertyItems",
+      },
+      {
+        connection: 2,
+        requestData: {
+          imageCompressionQuality: 75,
+          imageFormat: "jpg",
+          imageHeight: 540,
+          imageWidth: 960,
+          sourceUuid: "input-uuid",
+        },
+        requestType: "GetSourceScreenshot",
+      },
+    ]);
+    expect(observed.map((request) => request.requestType)).not.toContain("SetCurrentProgramScene");
+    expect(JSON.stringify(observed)).not.toContain("source_record");
+  });
+
+  it("renders an unconfigured window only through Studio Mode Preview and restores it before removal", async () => {
+    const observed: Array<{ connection: number; requestData?: unknown; requestType: string }> = [];
+    let connection = 0;
+    let inputName = "";
+    let sceneName = "";
+    const fakeObs = await startObsServer((socket) => {
+      connection += 1;
+      const connectionNumber = connection;
+      socket.send(message(0, { obsWebSocketVersion: "5.5.0", rpcVersion: 1 }));
+      socket.on("message", (raw) => {
+        const incoming = JSON.parse(raw.toString()) as { d: Record<string, unknown>; op: number };
+        if (incoming.op === 1) {
+          socket.send(message(2, { negotiatedRpcVersion: 1 }));
+          return;
+        }
+        if (incoming.op !== 6 || typeof incoming.d.requestType !== "string") return;
+        const requestType = incoming.d.requestType;
+        observed.push({ connection: connectionNumber, requestData: incoming.d.requestData, requestType });
+        if (requestType === "CreateScene") sceneName = (incoming.d.requestData as { sceneName: string }).sceneName;
+        if (requestType === "CreateInput") inputName = (incoming.d.requestData as { inputName: string }).inputName;
+        const responseData = connectionNumber === 1
+          ? requestType === "GetInputList"
+            ? { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "configured-uuid" }] }
+            : requestType === "GetInputSettings"
+              ? { inputSettings: { type: 1 } }
+              : requestType === "GetInputPropertiesListPropertyItems"
+                ? { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] }
+                : undefined
+          : connectionNumber === 2
+            ? requestType === "CreateScene"
+              ? { sceneUuid: "temporary-scene-uuid" }
+              : requestType === "CreateInput"
+                ? { inputUuid: "temporary-input-uuid", sceneItemId: 7 }
+                : requestType === "GetStudioModeEnabled"
+                  ? { studioModeEnabled: false }
+                  : requestType === "GetCurrentPreviewScene"
+                    ? { currentPreviewSceneUuid: "previous-preview-uuid" }
+                    : requestType === "GetSourceScreenshot"
+                      ? { imageData: tinyJpegDataUrl() }
+                      : ["SetStudioModeEnabled", "SetCurrentPreviewScene", "SetSceneItemEnabled"].includes(requestType)
+                        ? {}
+                        : undefined
+            : connectionNumber === 3
+              ? requestType === "GetInputList"
+                ? { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] }
+                : requestType === "GetSceneList"
+                  ? { scenes: [{ sceneName }] }
+                  : ["SetSceneItemEnabled", "SetCurrentPreviewScene", "SetStudioModeEnabled", "RemoveInput", "RemoveScene"].includes(requestType)
+                    ? {}
+                    : undefined
+              : undefined;
+        if (responseData === undefined) throw new Error(`Unexpected OBS request: ${requestType}`);
+        socket.send(message(7, {
+          requestId: incoming.d.requestId,
+          requestStatus: { code: 100, result: true },
+          responseData,
+          requestType,
+        }));
+      });
+    });
+
+    const result = await previewCaptureTarget(
+      { host: "127.0.0.1", password: "unused-by-server", port: fakeObs.port },
+      encodeCaptureTargetRef("window", 42),
+    );
+
+    expect(result.previewMethod).toBe("temporary_window_probe");
+    expect(observed.map((request) => request.requestType)).toEqual([
+      "GetInputList",
+      "GetInputSettings",
+      "GetInputPropertiesListPropertyItems",
+      "CreateScene",
+      "CreateInput",
+      "GetStudioModeEnabled",
+      "SetStudioModeEnabled",
+      "GetCurrentPreviewScene",
+      "SetCurrentPreviewScene",
+      "SetSceneItemEnabled",
+      "GetSourceScreenshot",
+      "SetSceneItemEnabled",
+      "SetCurrentPreviewScene",
+      "SetStudioModeEnabled",
+      "GetInputList",
+      "RemoveInput",
+      "GetSceneList",
+      "RemoveScene",
+    ]);
+    expect(observed.map((request) => request.requestType)).not.toContain("SetCurrentProgramScene");
+    expect(JSON.stringify(observed)).not.toContain("source_record");
+    expect(observed.find((request) => request.requestType === "SetCurrentPreviewScene" && request.connection === 2))
+      .toMatchObject({ requestData: { sceneUuid: "temporary-scene-uuid" } });
+  });
 });
 
 function responseFor(requestType: string): Record<string, unknown> {
@@ -227,4 +388,14 @@ function message(op: number, d: Record<string, unknown>): string {
 function obsAuthentication(password: string, salt: string, challenge: string): string {
   const passwordSalt = createHash("sha256").update(password + salt).digest("base64");
   return createHash("sha256").update(passwordSalt + challenge).digest("base64");
+}
+
+function tinyJpegDataUrl(): string {
+  const bytes = Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x0a, 0x00, 0x0a, 0x03,
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xd9,
+  ]);
+  return `data:image/jpeg;base64,${bytes.toString("base64")}`;
 }

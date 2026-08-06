@@ -30,6 +30,9 @@ export type CapturePropertyName = "window";
 export type ObsReadRequest =
   | { type: "GetInputKindList" }
   | { type: "GetInputList" }
+  | { type: "GetSceneList" }
+  | { type: "GetStudioModeEnabled" }
+  | { type: "GetCurrentPreviewScene" }
   | { data: { inputName: string }; type: "GetInputSettings" }
   | {
       data: { inputName: string; propertyName: CapturePropertyName };
@@ -38,9 +41,46 @@ export type ObsReadRequest =
   | { type: "GetSourceFilterKindList" }
   | { type: "GetVersion" };
 
+/**
+ * Preview's mutation vocabulary is deliberately closed. In particular, tool
+ * input can never select an arbitrary OBS request, source name, or setting.
+ */
+export type ObsPreviewRequest =
+  | {
+      data: {
+        imageCompressionQuality: number;
+        imageFormat: "jpg";
+        imageHeight: number;
+        imageWidth: number;
+        sourceUuid: string;
+      };
+      type: "GetSourceScreenshot";
+    }
+  | { data: { sceneName: string }; type: "CreateScene" }
+  | {
+      data: {
+        inputKind: "screen_capture";
+        inputName: string;
+        inputSettings: { show_cursor: false; type: 1; window: number };
+        sceneItemEnabled: false;
+        sceneName: string;
+      };
+      type: "CreateInput";
+    }
+  | { data: { inputName?: string; inputUuid?: string }; type: "RemoveInput" }
+  | { data: { sceneName: string }; type: "RemoveScene" }
+  | { data: { studioModeEnabled: boolean }; type: "SetStudioModeEnabled" }
+  | { data: { sceneUuid: string }; type: "SetCurrentPreviewScene" }
+  | {
+      data: { sceneItemEnabled: boolean; sceneItemId: number; sceneName: string };
+      type: "SetSceneItemEnabled";
+    };
+
+export type ObsRequest = ObsReadRequest | ObsPreviewRequest;
+
 export interface ObsSocket {
   connect(options: ObsConnectionOptions): Promise<void>;
-  request(request: ObsReadRequest): Promise<unknown>;
+  request(request: ObsRequest): Promise<unknown>;
   disconnect(): void | Promise<void>;
 }
 
@@ -70,12 +110,18 @@ export class ObsWebSocketAdapter implements ObsSocket {
     });
   }
 
-  async request(request: ObsReadRequest): Promise<unknown> {
+  async request(request: ObsRequest): Promise<unknown> {
     switch (request.type) {
       case "GetInputKindList":
         return this.#socket.call("GetInputKindList");
       case "GetInputList":
         return this.#socket.call("GetInputList");
+      case "GetSceneList":
+        return this.#socket.call("GetSceneList");
+      case "GetStudioModeEnabled":
+        return this.#socket.call("GetStudioModeEnabled");
+      case "GetCurrentPreviewScene":
+        return this.#socket.call("GetCurrentPreviewScene");
       case "GetInputSettings":
         return this.#socket.call("GetInputSettings", request.data);
       case "GetInputPropertiesListPropertyItems":
@@ -87,6 +133,22 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("GetSourceFilterKindList");
       case "GetVersion":
         return this.#socket.call("GetVersion");
+      case "GetSourceScreenshot":
+        return this.#socket.call("GetSourceScreenshot", request.data);
+      case "CreateScene":
+        return this.#socket.call("CreateScene", request.data);
+      case "CreateInput":
+        return this.#socket.call("CreateInput", request.data);
+      case "RemoveInput":
+        return this.#socket.call("RemoveInput", request.data);
+      case "RemoveScene":
+        return this.#socket.call("RemoveScene", request.data);
+      case "SetStudioModeEnabled":
+        return this.#socket.call("SetStudioModeEnabled", request.data);
+      case "SetCurrentPreviewScene":
+        return this.#socket.call("SetCurrentPreviewScene", request.data);
+      case "SetSceneItemEnabled":
+        return this.#socket.call("SetSceneItemEnabled", request.data);
     }
   }
 

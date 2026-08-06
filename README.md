@@ -18,10 +18,18 @@ reference and regression evidence; it is not deleted as part of the
 migration. FFmpeg is no longer in the capture path. `ffprobe` may remain an
 optional, best-effort post-recording validator where it adds useful evidence.
 
-The TypeScript server is intentionally read-only at this stage. `get_status`
-reports OBS/version, screen-capture capability, and Source Record filter
-capability. `list_capture_targets` reports configured capture inputs and the
-currently selectable windows without changing OBS. It also reports explicit
+The TypeScript server exposes one explicit, sensitive preview action in
+addition to read-only discovery. `get_status` reports OBS/version,
+screen-capture capability, and Source Record filter capability.
+`list_capture_targets` reports configured capture inputs and the currently
+selectable windows without changing OBS. `preview_capture_target` accepts only
+one opaque reference returned by that discovery: it screenshots a matching
+configured source without mutation, or creates a disabled temporary
+`screen_capture` input in an isolated temporary scene for an unconfigured
+window. The temporary path momentarily uses OBS Studio Mode's Preview scene
+(never Program), enables the item only there to render it, restores the prior
+Preview and Studio Mode state, then removes both resources. Preview images can
+contain sensitive on-screen content. Discovery also reports explicit
 limitations for display, application, and camera lists that this OBS build
 cannot safely expose over WebSocket; already-configured selections remain
 visible when OBS reports their explicit target identifiers. Recording state
@@ -133,7 +141,8 @@ pnpm run smoke
 ```
 
 The command connects over Streamable HTTP, lists tools, calls `get_status` and
-`list_capture_targets`, and prints the responses. It does not mutate OBS.
+`list_capture_targets`, and prints the responses. It does not preview or
+mutate OBS.
 
 Skills remain deliberately deferred until real sessions using these tools
 establish a stable workflow worth packaging.
@@ -159,10 +168,14 @@ when an OBS source has an odd or otherwise unsupported size.
 - The MCP sidecar binds to loopback only and connects only to OBS at
   `127.0.0.1`. OBS WebSocket must be configured separately to avoid exposing
   its remote-control listener on the network.
-- `get_status` and `list_capture_targets` are read-only. Starting, stopping,
-  or changing OBS state is explicit and observable.
-- Future mutation tools will snapshot temporary OBS state before changing it
-  and restore it on request or safe cleanup.
+- `get_status` and `list_capture_targets` are read-only. Preview is explicit,
+  single-target, and may expose sensitive screen content. For an unconfigured
+  window it creates uniquely named temporary resources in an isolated scene,
+  temporarily renders only through Studio Mode Preview, restores the prior
+  Preview/Studio Mode state, and never changes Program. It reports
+  manual-recovery names if cleanup is incomplete.
+- Future recording mutation tools will snapshot temporary OBS state before
+  changing it and restore it on request or safe cleanup.
 - Future recording tools will report the final output path and, when
   configured, use `ffprobe` only to validate the completed file—not to capture
   or encode it.

@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ConfigError, type SidecarConfig } from "../server/config.js";
 import { McpHttpSidecar, type McpHttpSidecarOptions } from "../server/http.js";
 import { createMcpServer } from "../server/mcp.js";
-import type { ObsConnectionOptions, ObsReadRequest, ObsSocket } from "../server/obs.js";
+import type { ObsConnectionOptions, ObsReadRequest, ObsRequest, ObsSocket } from "../server/obs.js";
 
 class FakeObsSocket implements ObsSocket {
   connectedWith?: ObsConnectionOptions;
@@ -47,7 +47,11 @@ describe("MCP HTTP sidecar", () => {
     const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
     await client.connect(transport);
     const tools = await client.listTools();
-    expect(tools.tools.map((tool) => tool.name)).toEqual(["get_status", "list_capture_targets"]);
+    expect(tools.tools.map((tool) => tool.name)).toEqual([
+      "get_status",
+      "list_capture_targets",
+      "preview_capture_target",
+    ]);
 
     const result = await client.callTool({ name: "get_status", arguments: {} });
     expect(result.isError).not.toBe(true);
@@ -299,7 +303,65 @@ describe("MCP HTTP sidecar", () => {
     });
     await client.close();
   });
+
+  it("returns preview metadata plus an MCP image block without reflecting image data or credentials in text", async () => {
+    const discovery = new PreviewFakeObsSocket((request) => {
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Capture", inputUuid: "input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 42 } };
+      if (request.type === "GetInputPropertiesListPropertyItems") {
+        return { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] };
+      }
+      throw new Error(`Unexpected discovery request ${request.type}`);
+    });
+    const imageData = tinyJpegDataUrl();
+    const screenshot = new PreviewFakeObsSocket((request) => {
+      expect(request).toMatchObject({
+        data: { imageFormat: "jpg", sourceUuid: "input-uuid" },
+        type: "GetSourceScreenshot",
+      });
+      return { imageData };
+    });
+    const sockets = [discovery, screenshot];
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => {
+      const socket = sockets.shift();
+      if (!socket) throw new Error("Unexpected extra OBS connection");
+      return socket;
+    }));
+    const client = await connectClient(sidecar, "preview-test");
+
+    const result = await client.callTool({
+      arguments: { targetRef: "scenecap-target-v1.WyJ3aW5kb3ciLDQyXQ" },
+      name: "preview_capture_target",
+    }) as { content?: Array<{ data?: string; text?: string; type: string }>; isError?: boolean };
+
+    expect(result.isError).not.toBe(true);
+    const metadata = result.content?.[0];
+    const image = result.content?.[1];
+    expect(metadata).toMatchObject({ type: "text" });
+    expect(image).toMatchObject({ data: expect.any(String), mimeType: "image/jpeg", type: "image" });
+    expect(metadata?.text).toContain('"previewMethod":"configured_source"');
+    expect(metadata?.text).not.toContain("imageData");
+    expect(metadata?.text).not.toContain(imageData);
+    expect(metadata?.text).not.toContain("integration-secret");
+    await client.close();
+  });
 });
+
+class PreviewFakeObsSocket implements ObsSocket {
+  constructor(readonly responder: (request: ObsRequest) => unknown | Promise<unknown>) {}
+
+  async connect(options: ObsConnectionOptions): Promise<void> {
+    void options;
+  }
+
+  async request(request: ObsRequest): Promise<unknown> {
+    return this.responder(request);
+  }
+
+  disconnect(): void {}
+}
 
 async function startSidecar(
   factory: () => ReturnType<typeof createMcpServer>,
@@ -412,4 +474,14 @@ function initializeRequest(): object {
 
 function listToolsRequest(): object {
   return { id: 2, jsonrpc: "2.0", method: "tools/list", params: {} };
+}
+
+function tinyJpegDataUrl(): string {
+  const bytes = Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x0a, 0x00, 0x0a, 0x03,
+    0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+    0xff, 0xd9,
+  ]);
+  return `data:image/jpeg;base64,${bytes.toString("base64")}`;
 }
