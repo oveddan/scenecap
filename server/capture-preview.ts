@@ -12,6 +12,7 @@ import {
   createObsSocket,
   isAbortSignal,
   normalizeObsReadOptions,
+  ObsStatusError,
   type ObsReadOptions,
   type ObsSocket,
   type ObsSocketFactory,
@@ -23,6 +24,7 @@ export const CAPTURE_PREVIEW_IMAGE_WIDTH = 960;
 export const CAPTURE_PREVIEW_IMAGE_HEIGHT = 540;
 export const MAX_CAPTURE_PREVIEW_IMAGE_BYTES = 2 * 1024 * 1024;
 export const CAPTURE_PREVIEW_RENDER_WAIT_MS = 850;
+export const CAPTURE_PREVIEW_DISCONNECT_WAIT_MS = 400;
 const MAX_CAPTURE_PREVIEW_BASE64_CHARS = Math.ceil(MAX_CAPTURE_PREVIEW_IMAGE_BYTES / 3) * 4;
 
 export interface CapturePreview {
@@ -52,13 +54,15 @@ export class CapturePreviewError extends Error {
 
 export interface PreviewCleanupIdentifiers {
   inputName: string;
+  previousPreviewSceneUuid?: string;
+  previousStudioModeEnabled?: boolean;
   sceneName: string;
 }
 
 export class CapturePreviewCleanupError extends CapturePreviewError {
   constructor(
     readonly identifiers: PreviewCleanupIdentifiers,
-    readonly failures: Array<"input" | "scene" | "scene_item" | "preview_scene" | "studio_mode">,
+    readonly failures: Array<"input" | "scene" | "scene_item" | "preview_scene" | "studio_mode" | "program_scene">,
   ) {
     super("cleanup_failed", "Temporary preview resources could not be fully removed.");
     this.name = "CapturePreviewCleanupError";
@@ -69,12 +73,14 @@ interface TemporaryProbe {
   inputMayExist: boolean;
   inputName: string;
   inputUuid?: string;
+  programSceneUuid?: string;
   previewSceneMayHaveChanged: boolean;
   previousPreviewSceneUuid?: string;
   sceneMayExist: boolean;
   sceneItemId?: number;
   sceneItemMayHaveBeenEnabled: boolean;
   sceneName: string;
+  sceneUuid?: string;
   studioModeMayHaveChanged: boolean;
   studioModeWasEnabled?: boolean;
 }
@@ -132,7 +138,7 @@ export async function previewCaptureTarget(
     throw new CapturePreviewError("invalid_reference", "The capture target reference is invalid.");
   }
   const windowId = decoded.value;
-  return withTemporaryPreviewLock(() =>
+  return withTemporaryPreviewLock(options, deadline, () =>
     screenshotTemporaryWindowProbe(config, target, windowId, createSocket, options, deadline),
   );
 }
@@ -178,6 +184,7 @@ async function screenshotTemporaryWindowProbe(
   let image: CapturePreview["image"] | undefined;
   try {
     await connect(socket, config, options, deadline);
+    await assertTemporaryPreviewSafe(socket, probe, options, deadline);
     // Set this before the request: cancellation/timeouts can arrive after OBS
     // creates the resource but before its response reaches us.
     probe.sceneMayExist = true;
@@ -191,6 +198,7 @@ async function screenshotTemporaryWindowProbe(
     if (!sceneUuid) {
       throw new CapturePreviewError("preview_unavailable", "OBS did not return a temporary preview scene.");
     }
+    probe.sceneUuid = sceneUuid;
     probe.inputMayExist = true;
     const created = await boundedObsRead(
       socket,
@@ -217,26 +225,16 @@ async function screenshotTemporaryWindowProbe(
       throw new CapturePreviewError("preview_unavailable", "OBS did not return a temporary preview scene item.");
     }
     probe.sceneItemId = sceneItemId;
-    const studioMode = await boundedObsRead(
+    // Recheck immediately before touching Studio Mode: discovery and resource
+    // creation may have taken long enough for an operator to start output.
+    await assertTemporaryPreviewSafe(socket, probe, options, deadline);
+    probe.studioModeMayHaveChanged = true;
+    await boundedObsRead(
       socket,
-      () => socket.request({ type: "GetStudioModeEnabled" }),
+      () => socket.request({ data: { studioModeEnabled: true }, type: "SetStudioModeEnabled" }),
       options,
       deadline,
     );
-    const studioModeWasEnabled = objectBoolean(studioMode, "studioModeEnabled");
-    if (studioModeWasEnabled === undefined) {
-      throw new CapturePreviewError("preview_unavailable", "OBS did not report its Studio Mode state.");
-    }
-    probe.studioModeWasEnabled = studioModeWasEnabled;
-    if (!studioModeWasEnabled) {
-      probe.studioModeMayHaveChanged = true;
-      await boundedObsRead(
-        socket,
-        () => socket.request({ data: { studioModeEnabled: true }, type: "SetStudioModeEnabled" }),
-        options,
-        deadline,
-      );
-    }
     const previousPreview = await boundedObsRead(
       socket,
       () => socket.request({ type: "GetCurrentPreviewScene" }),
@@ -265,14 +263,14 @@ async function screenshotTemporaryWindowProbe(
       options,
       deadline,
     );
-    await boundedObsRead(socket, () => delay(CAPTURE_PREVIEW_RENDER_WAIT_MS), options, deadline);
+    await boundedRenderWait(options.signal, deadline);
     image = await requestScreenshot(socket, inputUuid, options, deadline);
   } catch (error) {
     primaryError = error;
   } finally {
     // Wait for the primary connection to close before a fresh connection
     // checks whether an ambiguously timed-out mutation took effect.
-    await disconnectQuietly(socket);
+    await disconnectQuietly(socket, CAPTURE_PREVIEW_DISCONNECT_WAIT_MS);
   }
 
   const cleanupError = await cleanupTemporaryProbe(config, probe, createSocket);
@@ -299,101 +297,70 @@ async function cleanupTemporaryProbe(
   const socket = createSocket();
   const options = normalizeObsReadOptions({ timeoutMs: CAPTURE_PREVIEW_CLEANUP_TIMEOUT_MS });
   const deadline = Date.now() + options.timeoutMs;
-  const failures: Array<"input" | "scene" | "scene_item" | "preview_scene" | "studio_mode"> = [];
+  const failures: Array<"input" | "scene" | "scene_item" | "preview_scene" | "studio_mode" | "program_scene"> = [];
   try {
     await connect(socket, config, options, deadline);
-    if (probe.sceneItemMayHaveBeenEnabled) {
-      try {
-        if (probe.sceneItemId === undefined) throw new Error("Temporary scene item was not identified.");
-        await boundedObsRead(
-          socket,
-          () => socket.request({
-            data: { sceneItemEnabled: false, sceneItemId: probe.sceneItemId as number, sceneName: probe.sceneName },
-            type: "SetSceneItemEnabled",
-          }),
-          options,
-          deadline,
-        );
-      } catch {
-        failures.push("scene_item");
-      }
-    }
-    if (probe.previewSceneMayHaveChanged) {
-      try {
-        if (!probe.previousPreviewSceneUuid) throw new Error("Previous Preview scene was not identified.");
-        await boundedObsRead(
-          socket,
-          () => socket.request({
-            data: { sceneUuid: probe.previousPreviewSceneUuid as string },
-            type: "SetCurrentPreviewScene",
-          }),
-          options,
-          deadline,
-        );
-      } catch {
+    const program = await boundedObsRead(socket, () => socket.request({ type: "GetCurrentProgramScene" }), options, deadline);
+    if (
+      objectString(program, "sceneUuid") === probe.sceneUuid
+      || objectString(program, "sceneName") === probe.sceneName
+    ) {
+      failures.push("program_scene");
+    } else {
+      const studio = await boundedObsRead(socket, () => socket.request({ type: "GetStudioModeEnabled" }), options, deadline);
+      const studioModeEnabled = objectBoolean(studio, "studioModeEnabled");
+      let previewRestored = !probe.previewSceneMayHaveChanged;
+      if (probe.previewSceneMayHaveChanged && studioModeEnabled === true) {
+        const preview = await boundedObsRead(socket, () => socket.request({ type: "GetCurrentPreviewScene" }), options, deadline);
+        const previewSceneUuid = objectString(preview, "currentPreviewSceneUuid");
+        if (previewSceneUuid !== probe.sceneUuid || !probe.previousPreviewSceneUuid) {
+          failures.push("preview_scene");
+        } else {
+          if (probe.sceneItemMayHaveBeenEnabled) {
+            try {
+              if (probe.sceneItemId === undefined) throw new Error("Temporary scene item was not identified.");
+              const sceneItemId = probe.sceneItemId;
+              await boundedObsRead(socket, () => socket.request({
+                data: { sceneItemEnabled: false, sceneItemId, sceneName: probe.sceneName },
+                type: "SetSceneItemEnabled",
+              }), options, deadline);
+            } catch {
+              failures.push("scene_item");
+            }
+          }
+          try {
+            await boundedObsRead(socket, () => socket.request({
+              data: { sceneUuid: probe.previousPreviewSceneUuid as string },
+              type: "SetCurrentPreviewScene",
+            }), options, deadline);
+            previewRestored = true;
+          } catch {
+            failures.push("preview_scene");
+          }
+        }
+      } else if (probe.previewSceneMayHaveChanged && studioModeEnabled === false) {
+        previewRestored = true;
+      } else if (probe.previewSceneMayHaveChanged) {
         failures.push("preview_scene");
       }
-    }
-    if (probe.studioModeMayHaveChanged) {
-      try {
-        if (probe.studioModeWasEnabled === undefined) throw new Error("Previous Studio Mode state was not identified.");
-        await boundedObsRead(
-          socket,
-          () => socket.request({ data: { studioModeEnabled: probe.studioModeWasEnabled as boolean }, type: "SetStudioModeEnabled" }),
-          options,
-          deadline,
-        );
-      } catch {
-        failures.push("studio_mode");
-      }
-    }
-    if (probe.inputMayExist) {
-      try {
-        const inputs = await boundedObsRead(
-          socket,
-          () => socket.request({ type: "GetInputList" }),
-          options,
-          deadline,
-        );
-        const input = findInput(inputs, probe.inputName);
-        if (!input) throw new Error("Could not verify temporary preview input cleanup.");
-        if (input.inputUuid) {
-          probe.inputUuid = input.inputUuid;
-          await boundedObsRead(
-            socket,
-            () => socket.request({ data: { inputUuid: input.inputUuid }, type: "RemoveInput" }),
-            options,
-            deadline,
-          );
+      if (probe.studioModeMayHaveChanged) {
+        if (studioModeEnabled === false) {
+          // Already at the original state; do not overwrite another client.
+        } else if (studioModeEnabled !== true || !previewRestored) {
+          failures.push("studio_mode");
+        } else {
+          try {
+            await boundedObsRead(socket, () => socket.request({
+              data: { studioModeEnabled: false }, type: "SetStudioModeEnabled",
+            }), options, deadline);
+          } catch {
+            failures.push("studio_mode");
+          }
         }
-      } catch {
-        failures.push("input");
       }
-    }
-    if (probe.sceneMayExist) {
-      try {
-        const scenes = await boundedObsRead(
-          socket,
-          () => socket.request({ type: "GetSceneList" }),
-          options,
-          deadline,
-        );
-        const sceneExists = hasSceneNamed(scenes, probe.sceneName);
-        if (sceneExists === undefined) throw new Error("Could not verify temporary preview scene cleanup.");
-        if (sceneExists) {
-          await boundedObsRead(
-            socket,
-            () => socket.request({ data: { sceneName: probe.sceneName }, type: "RemoveScene" }),
-            options,
-            deadline,
-          );
-        }
-      } catch {
-        failures.push("scene");
-      }
+      await removeTemporaryResources(socket, probe, options, deadline, failures);
     }
   } catch {
-    if (probe.sceneItemMayHaveBeenEnabled && !failures.includes("scene_item")) failures.push("scene_item");
     if (probe.previewSceneMayHaveChanged && !failures.includes("preview_scene")) failures.push("preview_scene");
     if (probe.studioModeMayHaveChanged && !failures.includes("studio_mode")) failures.push("studio_mode");
     if (probe.inputMayExist && !failures.includes("input")) failures.push("input");
@@ -405,6 +372,8 @@ async function cleanupTemporaryProbe(
     ? new CapturePreviewCleanupError(
         {
           inputName: probe.inputName,
+          ...(probe.previousPreviewSceneUuid ? { previousPreviewSceneUuid: probe.previousPreviewSceneUuid } : {}),
+          ...(probe.studioModeWasEnabled === false ? { previousStudioModeEnabled: false } : {}),
           sceneName: probe.sceneName,
         },
         failures,
@@ -412,18 +381,109 @@ async function cleanupTemporaryProbe(
     : undefined;
 }
 
-async function withTemporaryPreviewLock<T>(action: () => Promise<T>): Promise<T> {
+async function removeTemporaryResources(
+  socket: ObsSocket,
+  probe: TemporaryProbe,
+  options: Required<ObsReadOptions>,
+  deadline: number,
+  failures: Array<"input" | "scene" | "scene_item" | "preview_scene" | "studio_mode" | "program_scene">,
+): Promise<void> {
+  if (probe.inputMayExist) {
+    try {
+      const inputs = await boundedObsRead(socket, () => socket.request({ type: "GetInputList" }), options, deadline);
+      const input = findInput(inputs, probe.inputName);
+      if (!input) throw new Error("Could not verify temporary preview input cleanup.");
+      if (input.inputUuid) {
+        probe.inputUuid = input.inputUuid;
+        await boundedObsRead(socket, () => socket.request({ data: { inputUuid: input.inputUuid }, type: "RemoveInput" }), options, deadline);
+      }
+    } catch {
+      failures.push("input");
+    }
+  }
+  if (probe.sceneMayExist) {
+    try {
+      const scenes = await boundedObsRead(socket, () => socket.request({ type: "GetSceneList" }), options, deadline);
+      const sceneExists = hasSceneNamed(scenes, probe.sceneName);
+      if (sceneExists === undefined) throw new Error("Could not verify temporary preview scene cleanup.");
+      if (sceneExists) {
+        await boundedObsRead(socket, () => socket.request({ data: { sceneName: probe.sceneName }, type: "RemoveScene" }), options, deadline);
+      }
+    } catch {
+      failures.push("scene");
+    }
+  }
+}
+
+async function assertTemporaryPreviewSafe(
+  socket: ObsSocket,
+  probe: TemporaryProbe,
+  options: Required<ObsReadOptions>,
+  deadline: number,
+): Promise<void> {
+  const studio = await boundedObsRead(socket, () => socket.request({ type: "GetStudioModeEnabled" }), options, deadline);
+  const studioModeEnabled = objectBoolean(studio, "studioModeEnabled");
+  if (studioModeEnabled !== false) {
+    throw new CapturePreviewError("preview_unavailable", "Temporary preview requires OBS Studio Mode to be off.");
+  }
+  probe.studioModeWasEnabled = false;
+  for (const requestType of [
+    "GetStreamStatus",
+    "GetRecordStatus",
+    "GetReplayBufferStatus",
+    "GetVirtualCamStatus",
+  ] as const) {
+    const status = await boundedObsRead(socket, () => socket.request({ type: requestType }), options, deadline);
+    if (objectBoolean(status, "outputActive") !== false) {
+      throw new CapturePreviewError("preview_unavailable", "Temporary preview requires all OBS outputs to be inactive.");
+    }
+  }
+  const program = await boundedObsRead(socket, () => socket.request({ type: "GetCurrentProgramScene" }), options, deadline);
+  const programSceneUuid = objectString(program, "sceneUuid");
+  if (!programSceneUuid) {
+    throw new CapturePreviewError("preview_unavailable", "OBS did not report the current Program scene.");
+  }
+  probe.programSceneUuid = programSceneUuid;
+}
+
+async function withTemporaryPreviewLock<T>(
+  options: Required<ObsReadOptions>,
+  deadline: number,
+  action: () => Promise<T>,
+): Promise<T> {
   let release!: () => void;
-  const next = new Promise<void>((resolve) => {
+  const ticket = new Promise<void>((resolve) => {
     release = resolve;
   });
   const previous = temporaryPreviewTail;
-  temporaryPreviewTail = next;
-  await previous;
+  // A cancelled waiter releases its own ticket, but its successor still waits
+  // for every earlier holder because the queue tail is chained to `previous`.
+  temporaryPreviewTail = previous.then(() => ticket);
   try {
+    await waitForLock(previous, options.signal, deadline);
     return await action();
   } finally {
     release();
+  }
+}
+
+async function waitForLock(previous: Promise<void>, signal: AbortSignal, deadline: number): Promise<void> {
+  if (signal.aborted) throw new ObsStatusError("cancelled");
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new ObsStatusError("timeout");
+  let timeout: NodeJS.Timeout | undefined;
+  let rejectAbort: ((error: ObsStatusError) => void) | undefined;
+  const onAbort = () => rejectAbort?.(new ObsStatusError("cancelled"));
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    rejectAbort = reject;
+    timeout = setTimeout(() => reject(new ObsStatusError("timeout")), remaining);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    await Promise.race([previous, interrupted]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -564,16 +624,42 @@ function findInput(value: unknown, inputName: string): { inputUuid?: string } | 
   return {};
 }
 
-async function disconnectQuietly(socket: ObsSocket): Promise<void> {
+async function disconnectQuietly(socket: ObsSocket, timeoutMs = CAPTURE_PREVIEW_DISCONNECT_WAIT_MS): Promise<void> {
+  let timeout: NodeJS.Timeout | undefined;
   try {
-    await socket.disconnect();
+    await Promise.race([
+      Promise.resolve(socket.disconnect()),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, timeoutMs);
+      }),
+    ]);
   } catch {
     // Disconnect errors must not mask the operation or cleanup result.
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+async function boundedRenderWait(signal: AbortSignal, deadline: number): Promise<void> {
+  if (signal.aborted) throw new ObsStatusError("cancelled");
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw new ObsStatusError("timeout");
+  let renderTimer: NodeJS.Timeout | undefined;
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  let rejectAbort: ((error: ObsStatusError) => void) | undefined;
+  const onAbort = () => rejectAbort?.(new ObsStatusError("cancelled"));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      rejectAbort = reject;
+      renderTimer = setTimeout(resolve, CAPTURE_PREVIEW_RENDER_WAIT_MS);
+      deadlineTimer = setTimeout(() => reject(new ObsStatusError("timeout")), remaining);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  } finally {
+    if (renderTimer) clearTimeout(renderTimer);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function hasSceneNamed(value: unknown, sceneName: string): boolean | undefined {

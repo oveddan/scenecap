@@ -12,7 +12,12 @@ class PreviewSocket implements ObsSocket {
   connectedWith?: ObsConnectionOptions;
   disconnected = false;
 
-  constructor(readonly responder: (request: ObsRequest) => unknown | Promise<unknown>) {}
+  constructor(
+    readonly responder: (request: ObsRequest) => unknown | Promise<unknown>,
+    readonly activeOutput?: "GetStreamStatus" | "GetRecordStatus" | "GetReplayBufferStatus" | "GetVirtualCamStatus",
+    readonly programSceneUuid = "program-scene-uuid",
+    readonly hangDisconnect = false,
+  ) {}
 
   async connect(options: ObsConnectionOptions): Promise<void> {
     this.connectedWith = options;
@@ -20,11 +25,21 @@ class PreviewSocket implements ObsSocket {
 
   async request(request: ObsRequest): Promise<unknown> {
     this.requests.push(request);
+    if (
+      request.type === "GetStreamStatus"
+      || request.type === "GetRecordStatus"
+      || request.type === "GetReplayBufferStatus"
+      || request.type === "GetVirtualCamStatus"
+    ) {
+      return { outputActive: request.type === this.activeOutput };
+    }
+    if (request.type === "GetCurrentProgramScene") return { sceneUuid: this.programSceneUuid };
     return this.responder(request);
   }
 
-  disconnect(): void {
+  async disconnect(): Promise<void> {
     this.disconnected = true;
+    if (this.hangDisconnect) return new Promise<never>(() => undefined);
   }
 }
 
@@ -116,6 +131,8 @@ describe("previewCaptureTarget", () => {
       throw new Error(`Unexpected primary request ${request.type}`);
     });
     const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: true };
+      if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "temporary-scene-uuid" };
       if (request.type === "GetInputList") {
         return { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] };
       }
@@ -153,9 +170,20 @@ describe("previewCaptureTarget", () => {
     expect(sceneName).toMatch(/^__scenecap_preview_scene_[0-9a-f-]{36}$/);
     expect(inputName).toMatch(/^__scenecap_preview_input_[0-9a-f-]{36}$/);
     expect(primary.requests.map((request) => request.type)).toEqual([
+      "GetStudioModeEnabled",
+      "GetStreamStatus",
+      "GetRecordStatus",
+      "GetReplayBufferStatus",
+      "GetVirtualCamStatus",
+      "GetCurrentProgramScene",
       "CreateScene",
       "CreateInput",
       "GetStudioModeEnabled",
+      "GetStreamStatus",
+      "GetRecordStatus",
+      "GetReplayBufferStatus",
+      "GetVirtualCamStatus",
+      "GetCurrentProgramScene",
       "SetStudioModeEnabled",
       "GetCurrentPreviewScene",
       "SetCurrentPreviewScene",
@@ -163,6 +191,9 @@ describe("previewCaptureTarget", () => {
       "GetSourceScreenshot",
     ]);
     expect(cleanup.requests.map((request) => request.type)).toEqual([
+      "GetCurrentProgramScene",
+      "GetStudioModeEnabled",
+      "GetCurrentPreviewScene",
       "SetSceneItemEnabled",
       "SetCurrentPreviewScene",
       "SetStudioModeEnabled",
@@ -209,9 +240,8 @@ describe("previewCaptureTarget", () => {
       password: "preview-secret",
     });
     expect(cleanup.requests.map((request) => request.type)).toEqual([
-      "SetSceneItemEnabled",
-      "SetCurrentPreviewScene",
-      "SetStudioModeEnabled",
+      "GetCurrentProgramScene",
+      "GetStudioModeEnabled",
       "GetInputList",
       "RemoveInput",
       "GetSceneList",
@@ -219,7 +249,7 @@ describe("previewCaptureTarget", () => {
     ]);
   });
 
-  it("restores the prior Preview scene without toggling an already-enabled Studio Mode", async () => {
+  it("fails closed without creating resources when Studio Mode is already enabled", async () => {
     const discovery = discoverySocket({ listedWindow: 42 });
     let inputName = "";
     let sceneName = "";
@@ -239,6 +269,7 @@ describe("previewCaptureTarget", () => {
       throw new Error(`Unexpected original-Studio-Mode request ${request.type}`);
     });
     const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "SetSceneItemEnabled" || request.type === "SetCurrentPreviewScene") return {};
       if (request.type === "GetInputList") return { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] };
       if (request.type === "RemoveInput") return {};
@@ -248,19 +279,128 @@ describe("previewCaptureTarget", () => {
     });
     const sockets = [discovery, primary, cleanup];
 
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
+      kind: "preview_unavailable",
+    });
+    expect(primary.requests).toEqual([{ type: "GetStudioModeEnabled" }]);
+    expect(cleanup.requests).toEqual([]);
+  });
+
+  it("fails closed before resource creation while any OBS output is active", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const primary = new PreviewSocket(
+      (request) => {
+        if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+        throw new Error(`Unexpected active-output request ${request.type}`);
+      },
+      "GetRecordStatus",
+    );
+    const sockets = [discovery, primary];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
+      kind: "preview_unavailable",
+    });
+    expect(primary.requests.map((request) => request.type)).toEqual([
+      "GetStudioModeEnabled",
+      "GetStreamStatus",
+      "GetRecordStatus",
+    ]);
+  });
+
+  it("does not overwrite or remove a temporary scene promoted to Program", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const primary = temporaryPrimary();
+    const cleanup = new PreviewSocket(
+      (request) => {
+        throw new Error(`No cleanup mutation is safe after Program promotion: ${request.type}`);
+      },
+      undefined,
+      "temporary-scene-uuid",
+    );
+    const sockets = [discovery, primary, cleanup];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
+      failures: ["program_scene"],
+    });
+    expect(cleanup.requests.map((request) => request.type)).toEqual(["GetCurrentProgramScene"]);
+  });
+
+  it("starts fresh-connection cleanup after a primary disconnect hangs", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const primary = temporaryPrimary(true);
+    const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "GetInputList") return { inputs: [] };
+      if (request.type === "GetSceneList") return { scenes: [] };
+      throw new Error(`Unexpected hanging-disconnect cleanup request ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup];
+
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).resolves.toMatchObject({
       previewMethod: "temporary_window_probe",
     });
-    expect(primary.requests.map((request) => request.type)).not.toContain("SetStudioModeEnabled");
+    expect(cleanup.requests.map((request) => request.type)).toContain("GetCurrentProgramScene");
+    expect(primary.disconnected).toBe(true);
+  }, 5_000);
+
+  it("removes an aborted queued waiter without allowing a later waiter to bypass the holder", async () => {
+    let firstCreate!: () => void;
+    const firstCreated = new Promise<void>((resolve) => {
+      firstCreate = resolve;
+    });
+    let createCount = 0;
+    const factory = () => new PreviewSocket((request) => {
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "configured-input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1 } };
+      if (request.type === "GetInputPropertiesListPropertyItems") {
+        return { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] };
+      }
+      if (request.type === "CreateScene") {
+        createCount += 1;
+        if (createCount === 1) firstCreate();
+        return { sceneUuid: `temporary-scene-${createCount}` };
+      }
+      if (request.type === "CreateInput") return { inputUuid: `temporary-input-${createCount}`, sceneItemId: 7 };
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "SetStudioModeEnabled") return {};
+      if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "previous-preview-uuid" };
+      if (request.type === "SetCurrentPreviewScene" || request.type === "SetSceneItemEnabled") return {};
+      if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
+      if (request.type === "GetSceneList") return { scenes: [] };
+      throw new Error(`Unexpected lock-order request ${request.type}`);
+    });
+    const first = previewCaptureTarget(config, targetRef, factory);
+    await firstCreated;
+    const controller = new AbortController();
+    const cancelled = previewCaptureTarget(config, targetRef, factory, { signal: controller.signal });
+    await delay(20);
+    controller.abort();
+    const third = previewCaptureTarget(config, targetRef, factory);
+
+    await expect(cancelled).rejects.toMatchObject({ kind: "cancelled" });
+    await expect(Promise.all([first, third])).resolves.toHaveLength(2);
+    expect(createCount).toBe(2);
+  }, 8_000);
+
+  it("detects an external Preview conflict without overwriting Preview or Studio Mode", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const primary = temporaryPrimary();
+    const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: true };
+      if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "operator-preview-uuid" };
+      if (request.type === "GetInputList") return { inputs: [] };
+      if (request.type === "GetSceneList") return { scenes: [] };
+      throw new Error(`Unexpected conflict cleanup mutation ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
+      failures: expect.arrayContaining(["preview_scene", "studio_mode"]),
+    });
+    expect(cleanup.requests.map((request) => request.type)).not.toContain("SetCurrentPreviewScene");
     expect(cleanup.requests.map((request) => request.type)).not.toContain("SetStudioModeEnabled");
-    expect(cleanup.requests.map((request) => request.type)).toEqual([
-      "SetSceneItemEnabled",
-      "SetCurrentPreviewScene",
-      "GetInputList",
-      "RemoveInput",
-      "GetSceneList",
-      "RemoveScene",
-    ]);
   });
 
   it("cleans generated resources after cancellation during a remotely ambiguous CreateInput", async () => {
@@ -278,6 +418,7 @@ describe("previewCaptureTarget", () => {
         controller.abort();
         return new Promise<never>(() => undefined);
       }
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       throw new Error(`Unexpected primary request ${request.type}`);
     });
     const cleanup = cleanupSocket(() => inputName, () => sceneName);
@@ -286,6 +427,8 @@ describe("previewCaptureTarget", () => {
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets), { signal: controller.signal }))
       .rejects.toMatchObject({ kind: "cancelled" });
     expect(cleanup.requests.map((request) => request.type)).toEqual([
+      "GetCurrentProgramScene",
+      "GetStudioModeEnabled",
       "GetInputList",
       "RemoveInput",
       "GetSceneList",
@@ -311,6 +454,7 @@ describe("previewCaptureTarget", () => {
       throw new Error(`Unexpected primary request ${request.type}`);
     });
     const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "SetSceneItemEnabled") return {};
       if (request.type === "SetCurrentPreviewScene") return {};
       if (request.type === "SetStudioModeEnabled") return {};
@@ -331,9 +475,8 @@ describe("previewCaptureTarget", () => {
       },
     });
     expect(cleanup.requests.map((request) => request.type)).toEqual([
-      "SetSceneItemEnabled",
-      "SetCurrentPreviewScene",
-      "SetStudioModeEnabled",
+      "GetCurrentProgramScene",
+      "GetStudioModeEnabled",
       "GetInputList",
       "GetSceneList",
       "RemoveScene",
@@ -422,6 +565,7 @@ function discoverySocket({ configuredWindow, listedWindow }: { configuredWindow?
 
 function cleanupSocket(inputName: () => string, sceneName: () => string): PreviewSocket {
   return new PreviewSocket((request) => {
+    if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
     if (request.type === "SetSceneItemEnabled") return {};
     if (request.type === "SetCurrentPreviewScene") return {};
     if (request.type === "SetStudioModeEnabled") return {};
@@ -433,6 +577,19 @@ function cleanupSocket(inputName: () => string, sceneName: () => string): Previe
     if (request.type === "RemoveScene") return {};
     throw new Error(`Unexpected cleanup request ${request.type}`);
   });
+}
+
+function temporaryPrimary(hangDisconnect = false): PreviewSocket {
+  return new PreviewSocket((request) => {
+    if (request.type === "CreateScene") return { sceneUuid: "temporary-scene-uuid" };
+    if (request.type === "CreateInput") return { inputUuid: "temporary-input-uuid", sceneItemId: 7 };
+    if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+    if (request.type === "SetStudioModeEnabled") return {};
+    if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "previous-preview-uuid" };
+    if (request.type === "SetCurrentPreviewScene" || request.type === "SetSceneItemEnabled") return {};
+    if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
+    throw new Error(`Unexpected temporary primary request ${request.type}`);
+  }, undefined, "program-scene-uuid", hangDisconnect);
 }
 
 function nextSocket(sockets: PreviewSocket[]): PreviewSocket {
@@ -458,4 +615,8 @@ function jpegDataUrl(width: number, height: number, padding = 0): string {
     0xff, 0xd9,
   ]);
   return `data:image/jpeg;base64,${bytes.toString("base64")}`;
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }

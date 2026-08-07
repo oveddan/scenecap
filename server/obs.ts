@@ -33,6 +33,11 @@ export type ObsReadRequest =
   | { type: "GetSceneList" }
   | { type: "GetStudioModeEnabled" }
   | { type: "GetCurrentPreviewScene" }
+  | { type: "GetCurrentProgramScene" }
+  | { type: "GetStreamStatus" }
+  | { type: "GetRecordStatus" }
+  | { type: "GetReplayBufferStatus" }
+  | { type: "GetVirtualCamStatus" }
   | { data: { inputName: string }; type: "GetInputSettings" }
   | {
       data: { inputName: string; propertyName: CapturePropertyName };
@@ -122,6 +127,16 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("GetStudioModeEnabled");
       case "GetCurrentPreviewScene":
         return this.#socket.call("GetCurrentPreviewScene");
+      case "GetCurrentProgramScene":
+        return this.#socket.call("GetCurrentProgramScene");
+      case "GetStreamStatus":
+        return this.#socket.call("GetStreamStatus");
+      case "GetRecordStatus":
+        return this.#socket.call("GetRecordStatus");
+      case "GetReplayBufferStatus":
+        return this.#socket.call("GetReplayBufferStatus");
+      case "GetVirtualCamStatus":
+        return this.#socket.call("GetVirtualCamStatus");
       case "GetInputSettings":
         return this.#socket.call("GetInputSettings", request.data);
       case "GetInputPropertiesListPropertyItems":

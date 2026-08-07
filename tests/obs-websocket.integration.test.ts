@@ -257,7 +257,11 @@ describe("ObsWebSocketAdapter", () => {
                 ? { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] }
                 : undefined
           : connectionNumber === 2
-            ? requestType === "CreateScene"
+            ? ["GetStreamStatus", "GetRecordStatus", "GetReplayBufferStatus", "GetVirtualCamStatus"].includes(requestType)
+              ? { outputActive: false }
+              : requestType === "GetCurrentProgramScene"
+                ? { sceneUuid: "program-scene-uuid" }
+                : requestType === "CreateScene"
               ? { sceneUuid: "temporary-scene-uuid" }
               : requestType === "CreateInput"
                 ? { inputUuid: "temporary-input-uuid", sceneItemId: 7 }
@@ -271,7 +275,11 @@ describe("ObsWebSocketAdapter", () => {
                         ? {}
                         : undefined
             : connectionNumber === 3
-              ? requestType === "GetInputList"
+              ? requestType === "GetCurrentProgramScene"
+                ? { sceneUuid: "program-scene-uuid" }
+                : requestType === "GetStudioModeEnabled"
+                  ? { studioModeEnabled: false }
+                  : requestType === "GetInputList"
                 ? { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] }
                 : requestType === "GetSceneList"
                   ? { scenes: [{ sceneName }] }
@@ -299,17 +307,27 @@ describe("ObsWebSocketAdapter", () => {
       "GetInputList",
       "GetInputSettings",
       "GetInputPropertiesListPropertyItems",
+      "GetStudioModeEnabled",
+      "GetStreamStatus",
+      "GetRecordStatus",
+      "GetReplayBufferStatus",
+      "GetVirtualCamStatus",
+      "GetCurrentProgramScene",
       "CreateScene",
       "CreateInput",
       "GetStudioModeEnabled",
+      "GetStreamStatus",
+      "GetRecordStatus",
+      "GetReplayBufferStatus",
+      "GetVirtualCamStatus",
+      "GetCurrentProgramScene",
       "SetStudioModeEnabled",
       "GetCurrentPreviewScene",
       "SetCurrentPreviewScene",
       "SetSceneItemEnabled",
       "GetSourceScreenshot",
-      "SetSceneItemEnabled",
-      "SetCurrentPreviewScene",
-      "SetStudioModeEnabled",
+      "GetCurrentProgramScene",
+      "GetStudioModeEnabled",
       "GetInputList",
       "RemoveInput",
       "GetSceneList",

@@ -172,8 +172,13 @@ when an OBS source has an odd or otherwise unsupported size.
   single-target, and may expose sensitive screen content. For an unconfigured
   window it creates uniquely named temporary resources in an isolated scene,
   temporarily renders only through Studio Mode Preview, restores the prior
-  Preview/Studio Mode state, and never changes Program. It reports
-  manual-recovery names if cleanup is incomplete.
+  Preview/Studio Mode state, and never sends a Program mutation. It fails
+  closed if Studio Mode is already in use or streaming, recording, replay, or
+  Virtual Camera output is active. Cleanup compares current Preview, Studio,
+  and Program state before writing: external changes are left untouched and
+  reported with conflict-specific manual recovery guidance. Temporary probes
+  are serialized in this sidecar, but that does not coordinate other OBS
+  clients.
 - Future recording mutation tools will snapshot temporary OBS state before
   changing it and restore it on request or safe cleanup.
 - Future recording tools will report the final output path and, when

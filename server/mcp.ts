@@ -104,7 +104,7 @@ export function createMcpServer(
     {
       title: "Preview one OBS capture target",
       description:
-        "Explicitly capture a bounded still preview for one target reference returned by list_capture_targets. Existing configured sources are read without changing OBS. An unconfigured available window is rendered through a temporary isolated scene in OBS Studio Mode Preview, then its prior Preview and Studio Mode state are restored and the resources removed; Program is never changed. Preview images may contain sensitive on-screen content.",
+        "Explicitly capture a bounded still preview for one target reference returned by list_capture_targets. Existing configured sources are read without changing OBS. A temporary window preview requires Studio Mode off and all OBS outputs inactive, then uses only Studio Mode Preview; scenecap never sends a Program mutation. Cleanup compares current state before restoring it and reports external conflicts for manual recovery. Preview images may contain sensitive on-screen content.",
       inputSchema: {
         targetRef: z.string().min(1).max(2_100),
       },
@@ -179,7 +179,7 @@ function previewFailureResult(error: unknown) {
     cleanup: {
       failures: error.failures,
       identifiers: error.identifiers,
-      manualRecovery: "Remove only the listed temporary preview input and scene in OBS.",
+      manualRecovery: cleanupGuidance(error.failures),
     },
   } : {};
   return {
@@ -196,6 +196,26 @@ function previewFailureResult(error: unknown) {
     ],
     isError: true,
   };
+}
+
+function cleanupGuidance(failures: CapturePreviewCleanupError["failures"]): string[] {
+  const guidance: string[] = [];
+  if (failures.includes("program_scene")) {
+    guidance.push("The temporary scene is Program; do not remove it until an operator changes Program in OBS.");
+  }
+  if (failures.includes("preview_scene")) {
+    guidance.push("Preview changed outside this tool; restore it manually only after confirming the current operator intent.");
+  }
+  if (failures.includes("studio_mode")) {
+    guidance.push("Studio Mode state changed outside this tool; confirm it manually before altering it.");
+  }
+  if (failures.includes("scene_item")) {
+    guidance.push("Disable the listed temporary scene item only after confirming it is still the scenecap preview item.");
+  }
+  if (failures.includes("input") || failures.includes("scene")) {
+    guidance.push("Remove only the listed temporary preview input and scene after resolving any state conflicts.");
+  }
+  return guidance;
 }
 
 export function curatedPreviewFailureReason(error: unknown): string {
