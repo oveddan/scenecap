@@ -316,6 +316,49 @@ describe("previewCaptureTarget", () => {
     ]);
   });
 
+  it("does not invent cleanup work after a definitive CreateScene rejection", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const rejection = Object.assign(new Error("scene rejected"), { code: 500 });
+    const primary = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "CreateScene") throw rejection;
+      throw new Error(`Unexpected rejected-scene request ${request.type}`);
+    });
+    const sockets = [discovery, primary];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toBe(rejection);
+    expect(primary.requests.map((request) => request.type)).not.toContain("CreateInput");
+    expect(sockets).toEqual([]);
+  });
+
+  it("removes only the confirmed scene after a definitive CreateInput rejection", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const rejection = Object.assign(new Error("input rejected"), { code: 601 });
+    let sceneName = "";
+    const primary = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "CreateScene") {
+        sceneName = request.data.sceneName;
+        return { sceneUuid: "temporary-scene-uuid" };
+      }
+      if (request.type === "CreateInput") throw rejection;
+      throw new Error(`Unexpected rejected-input request ${request.type}`);
+    });
+    const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "RemoveScene") {
+        expect(request.data).toEqual({ sceneName });
+        return {};
+      }
+      throw new Error(`Unexpected rejected-input cleanup request ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toBe(rejection);
+    expect(cleanup.requests.map((request) => request.type)).not.toContain("RemoveInput");
+    expect(cleanup.requests.map((request) => request.type)).toContain("RemoveScene");
+  });
+
   it.each(["GetReplayBufferStatus", "GetVirtualCamStatus"] as const)(
     "treats a recognized unavailable %s status as inactive",
     async (unavailableOutput) => {
@@ -494,6 +537,7 @@ describe("previewCaptureTarget", () => {
 
   it("suppresses an otherwise successful image when temporary cleanup is incomplete", async () => {
     const discovery = discoverySocket({ listedWindow: 42 });
+    let inputName = "";
     let sceneName = "";
     let sceneRemoved = false;
     const primary = new PreviewSocket((request) => {
@@ -501,7 +545,10 @@ describe("previewCaptureTarget", () => {
         sceneName = request.data.sceneName;
         return { sceneUuid: "temporary-scene-uuid" };
       }
-      if (request.type === "CreateInput") return { inputUuid: "temporary-input-uuid", sceneItemId: 7 };
+      if (request.type === "CreateInput") {
+        inputName = request.data.inputName;
+        return { inputUuid: "temporary-input-uuid", sceneItemId: 7 };
+      }
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "SetStudioModeEnabled") return {};
       if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "previous-preview-uuid" };
@@ -523,7 +570,14 @@ describe("previewCaptureTarget", () => {
       }
       throw new Error(`Unexpected cleanup request ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
+    const verifier = new PreviewSocket((request) => {
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] };
+      }
+      if (request.type === "GetSceneList") return { scenes: [] };
+      throw new Error(`Unexpected incomplete-cleanup verification request ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup, verifier];
 
     // The rejected promise establishes no image is returned; the error exposes
     // only generated names suitable for manual cleanup.
@@ -540,6 +594,22 @@ describe("previewCaptureTarget", () => {
       "RemoveInput",
       "RemoveScene",
     ]));
+  });
+
+  it("accepts fresh proof of absence when removal responses are lost", async () => {
+    const discovery = discoverySocket({ listedWindow: 42 });
+    const primary = temporaryPrimary();
+    const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "RemoveInput") throw new Error("input response lost");
+      if (request.type === "RemoveScene") throw new Error("scene response lost");
+      throw new Error(`Unexpected lost-response cleanup request ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
+
+    await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).resolves.toMatchObject({
+      previewMethod: "temporary_window_probe",
+    });
   });
 
   it("serializes temporary probes so concurrent sessions cannot overlap Studio Mode state", async () => {
