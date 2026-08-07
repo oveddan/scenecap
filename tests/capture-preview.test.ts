@@ -17,6 +17,7 @@ class PreviewSocket implements ObsSocket {
     readonly activeOutput?: "GetStreamStatus" | "GetRecordStatus" | "GetReplayBufferStatus" | "GetVirtualCamStatus",
     readonly programSceneUuid = "program-scene-uuid",
     readonly hangDisconnect = false,
+    readonly unavailableOutput?: "GetReplayBufferStatus" | "GetVirtualCamStatus",
   ) {}
 
   async connect(options: ObsConnectionOptions): Promise<void> {
@@ -31,6 +32,10 @@ class PreviewSocket implements ObsSocket {
       || request.type === "GetReplayBufferStatus"
       || request.type === "GetVirtualCamStatus"
     ) {
+      if (request.type === this.unavailableOutput) {
+        const label = request.type === "GetReplayBufferStatus" ? "Replay buffer" : "Virtual camera";
+        throw Object.assign(new Error(`${label} is not available.`), { code: 604 });
+      }
       return { outputActive: request.type === this.activeOutput };
     }
     if (request.type === "GetCurrentProgramScene") return { sceneUuid: this.programSceneUuid };
@@ -130,11 +135,13 @@ describe("previewCaptureTarget", () => {
       }
       throw new Error(`Unexpected primary request ${request.type}`);
     });
+    let inputRemoved = false;
+    let sceneRemoved = false;
     const cleanup = new PreviewSocket((request) => {
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: true };
       if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "temporary-scene-uuid" };
       if (request.type === "GetInputList") {
-        return { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] };
+        return { inputs: inputRemoved ? [] : [{ inputName, inputUuid: "temporary-input-uuid" }] };
       }
       if (request.type === "SetSceneItemEnabled") {
         expect(request.data).toEqual({ sceneItemEnabled: false, sceneItemId: 7, sceneName });
@@ -150,16 +157,18 @@ describe("previewCaptureTarget", () => {
       }
       if (request.type === "RemoveInput") {
         expect(request.data).toEqual({ inputUuid: "temporary-input-uuid" });
+        inputRemoved = true;
         return {};
       }
-      if (request.type === "GetSceneList") return { scenes: [{ sceneName }] };
+      if (request.type === "GetSceneList") return { scenes: sceneRemoved ? [] : [{ sceneName }] };
       if (request.type === "RemoveScene") {
         expect(request.data).toEqual({ sceneName });
+        sceneRemoved = true;
         return {};
       }
       throw new Error(`Unexpected cleanup request ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     const result = await previewCaptureTarget(config, targetRef, () => nextSocket(sockets));
 
@@ -197,9 +206,7 @@ describe("previewCaptureTarget", () => {
       "SetSceneItemEnabled",
       "SetCurrentPreviewScene",
       "SetStudioModeEnabled",
-      "GetInputList",
       "RemoveInput",
-      "GetSceneList",
       "RemoveScene",
     ]);
     expect(primary.disconnected).toBe(true);
@@ -228,7 +235,7 @@ describe("previewCaptureTarget", () => {
       throw new Error(`Unexpected primary request ${request.type}`);
     });
     const cleanup = cleanupSocket(() => inputName, () => sceneName);
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets), { timeoutMs: 80 }))
       .rejects.toMatchObject({ kind: "timeout" });
@@ -242,9 +249,7 @@ describe("previewCaptureTarget", () => {
     expect(cleanup.requests.map((request) => request.type)).toEqual([
       "GetCurrentProgramScene",
       "GetStudioModeEnabled",
-      "GetInputList",
       "RemoveInput",
-      "GetSceneList",
       "RemoveScene",
     ]);
   });
@@ -268,16 +273,20 @@ describe("previewCaptureTarget", () => {
       if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
       throw new Error(`Unexpected original-Studio-Mode request ${request.type}`);
     });
+    let sceneRemoved = false;
     const cleanup = new PreviewSocket((request) => {
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "SetSceneItemEnabled" || request.type === "SetCurrentPreviewScene") return {};
       if (request.type === "GetInputList") return { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] };
       if (request.type === "RemoveInput") return {};
-      if (request.type === "GetSceneList") return { scenes: [{ sceneName }] };
-      if (request.type === "RemoveScene") return {};
+      if (request.type === "GetSceneList") return { scenes: sceneRemoved ? [] : [{ sceneName }] };
+      if (request.type === "RemoveScene") {
+        sceneRemoved = true;
+        return {};
+      }
       throw new Error(`Unexpected original-Studio-Mode cleanup ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
       kind: "preview_unavailable",
@@ -307,6 +316,27 @@ describe("previewCaptureTarget", () => {
     ]);
   });
 
+  it.each(["GetReplayBufferStatus", "GetVirtualCamStatus"] as const)(
+    "treats a recognized unavailable %s status as inactive",
+    async (unavailableOutput) => {
+      const discovery = discoverySocket({ listedWindow: 42 });
+      const primary = temporaryPrimary(false, unavailableOutput);
+      const cleanup = new PreviewSocket((request) => {
+        if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+        if (request.type === "GetInputList") return { inputs: [] };
+        if (request.type === "GetSceneList") return { scenes: [] };
+        if (request.type === "RemoveInput" || request.type === "RemoveScene") return {};
+        throw new Error(`Unexpected optional-output cleanup request ${request.type}`);
+      });
+      const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
+
+      await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).resolves.toMatchObject({
+        previewMethod: "temporary_window_probe",
+      });
+      expect(primary.requests.map((request) => request.type)).toContain(unavailableOutput);
+    },
+  );
+
   it("does not overwrite or remove a temporary scene promoted to Program", async () => {
     const discovery = discoverySocket({ listedWindow: 42 });
     const primary = temporaryPrimary();
@@ -317,7 +347,7 @@ describe("previewCaptureTarget", () => {
       undefined,
       "temporary-scene-uuid",
     );
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
       failures: ["program_scene"],
@@ -332,9 +362,10 @@ describe("previewCaptureTarget", () => {
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "GetInputList") return { inputs: [] };
       if (request.type === "GetSceneList") return { scenes: [] };
+      if (request.type === "RemoveInput" || request.type === "RemoveScene") return {};
       throw new Error(`Unexpected hanging-disconnect cleanup request ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).resolves.toMatchObject({
       previewMethod: "temporary_window_probe",
@@ -362,13 +393,14 @@ describe("previewCaptureTarget", () => {
         if (createCount === 1) firstCreate();
         return { sceneUuid: `temporary-scene-${createCount}` };
       }
-      if (request.type === "CreateInput") return { inputUuid: `temporary-input-${createCount}`, sceneItemId: 7 };
+      if (request.type === "CreateInput") return { inputUuid: `uuid-${request.data.sceneName}`, sceneItemId: 7 };
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       if (request.type === "SetStudioModeEnabled") return {};
       if (request.type === "GetCurrentPreviewScene") return { currentPreviewSceneUuid: "previous-preview-uuid" };
       if (request.type === "SetCurrentPreviewScene" || request.type === "SetSceneItemEnabled") return {};
       if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
       if (request.type === "GetSceneList") return { scenes: [] };
+      if (request.type === "RemoveInput" || request.type === "RemoveScene") return {};
       throw new Error(`Unexpected lock-order request ${request.type}`);
     });
     const first = previewCaptureTarget(config, targetRef, factory);
@@ -394,7 +426,7 @@ describe("previewCaptureTarget", () => {
       if (request.type === "GetSceneList") return { scenes: [] };
       throw new Error(`Unexpected conflict cleanup mutation ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets))).rejects.toMatchObject({
       failures: expect.arrayContaining(["preview_scene", "studio_mode"]),
@@ -421,8 +453,31 @@ describe("previewCaptureTarget", () => {
       if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
       throw new Error(`Unexpected primary request ${request.type}`);
     });
-    const cleanup = cleanupSocket(() => inputName, () => sceneName);
-    const sockets = [discovery, primary, cleanup];
+    let inputListReads = 0;
+    let inputRemoved = false;
+    let sceneRemoved = false;
+    const cleanup = new PreviewSocket((request) => {
+      if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
+      if (request.type === "GetInputList") {
+        inputListReads += 1;
+        return {
+          inputs: inputListReads < 3 || inputRemoved
+            ? []
+            : [{ inputName, inputUuid: "temporary-input-uuid" }],
+        };
+      }
+      if (request.type === "RemoveInput") {
+        inputRemoved = true;
+        return {};
+      }
+      if (request.type === "RemoveScene") {
+        sceneRemoved = true;
+        return {};
+      }
+      if (request.type === "GetSceneList") return { scenes: sceneRemoved ? [] : [{ sceneName }] };
+      throw new Error(`Unexpected ambiguous cleanup request ${request.type}`);
+    });
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     await expect(previewCaptureTarget(config, targetRef, () => nextSocket(sockets), { signal: controller.signal }))
       .rejects.toMatchObject({ kind: "cancelled" });
@@ -430,8 +485,9 @@ describe("previewCaptureTarget", () => {
       "GetCurrentProgramScene",
       "GetStudioModeEnabled",
       "GetInputList",
+      "GetInputList",
+      "GetInputList",
       "RemoveInput",
-      "GetSceneList",
       "RemoveScene",
     ]);
   });
@@ -439,6 +495,7 @@ describe("previewCaptureTarget", () => {
   it("suppresses an otherwise successful image when temporary cleanup is incomplete", async () => {
     const discovery = discoverySocket({ listedWindow: 42 });
     let sceneName = "";
+    let sceneRemoved = false;
     const primary = new PreviewSocket((request) => {
       if (request.type === "CreateScene") {
         sceneName = request.data.sceneName;
@@ -459,11 +516,14 @@ describe("previewCaptureTarget", () => {
       if (request.type === "SetCurrentPreviewScene") return {};
       if (request.type === "SetStudioModeEnabled") return {};
       if (request.type === "GetInputList") throw new Error("cleanup input query failed");
-      if (request.type === "GetSceneList") return { scenes: [{ sceneName }] };
-      if (request.type === "RemoveScene") return {};
+      if (request.type === "GetSceneList") return { scenes: sceneRemoved ? [] : [{ sceneName }] };
+      if (request.type === "RemoveScene") {
+        sceneRemoved = true;
+        return {};
+      }
       throw new Error(`Unexpected cleanup request ${request.type}`);
     });
-    const sockets = [discovery, primary, cleanup];
+    const sockets = [discovery, primary, cleanup, emptyVerificationSocket()];
 
     // The rejected promise establishes no image is returned; the error exposes
     // only generated names suitable for manual cleanup.
@@ -474,27 +534,29 @@ describe("previewCaptureTarget", () => {
         sceneName: expect.stringMatching(/^__scenecap_preview_scene_/),
       },
     });
-    expect(cleanup.requests.map((request) => request.type)).toEqual([
+    expect(cleanup.requests.map((request) => request.type)).toEqual(expect.arrayContaining([
       "GetCurrentProgramScene",
       "GetStudioModeEnabled",
-      "GetInputList",
-      "GetSceneList",
+      "RemoveInput",
       "RemoveScene",
-    ]);
+    ]));
   });
 
   it("serializes temporary probes so concurrent sessions cannot overlap Studio Mode state", async () => {
     const activeScenes = new Set<string>();
+    const removedInputs = new Set<string>();
     let maxActiveScenes = 0;
     const factory = () => new PreviewSocket((request) => {
       if (request.type === "GetInputList") {
         return {
           inputs: [
             { inputKind: "screen_capture", inputName: "Probe", inputUuid: "configured-input-uuid" },
-            ...[...activeScenes].map((sceneName) => ({
+            ...[...activeScenes]
+              .map((sceneName) => ({
               inputName: sceneName.replace("_scene_", "_input_"),
               inputUuid: `uuid-${sceneName}`,
-            })),
+              }))
+              .filter((input) => !removedInputs.has(input.inputName)),
           ],
         };
       }
@@ -514,7 +576,12 @@ describe("previewCaptureTarget", () => {
       if (request.type === "SetCurrentPreviewScene") return {};
       if (request.type === "SetSceneItemEnabled") return {};
       if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
-      if (request.type === "RemoveInput") return {};
+      if (request.type === "RemoveInput") {
+        if (request.data.inputUuid?.startsWith("uuid-")) {
+          removedInputs.add(request.data.inputUuid.slice("uuid-".length));
+        }
+        return {};
+      }
       if (request.type === "GetSceneList") return { scenes: [...activeScenes].map((sceneName) => ({ sceneName })) };
       if (request.type === "RemoveScene") {
         activeScenes.delete(request.data.sceneName);
@@ -564,22 +631,41 @@ function discoverySocket({ configuredWindow, listedWindow }: { configuredWindow?
 }
 
 function cleanupSocket(inputName: () => string, sceneName: () => string): PreviewSocket {
+  let inputRemoved = false;
+  let sceneRemoved = false;
   return new PreviewSocket((request) => {
     if (request.type === "GetStudioModeEnabled") return { studioModeEnabled: false };
     if (request.type === "SetSceneItemEnabled") return {};
     if (request.type === "SetCurrentPreviewScene") return {};
     if (request.type === "SetStudioModeEnabled") return {};
     if (request.type === "GetInputList") {
-      return { inputs: [{ inputName: inputName(), inputUuid: "temporary-input-uuid" }] };
+      return { inputs: inputRemoved ? [] : [{ inputName: inputName(), inputUuid: "temporary-input-uuid" }] };
     }
-    if (request.type === "RemoveInput") return {};
-    if (request.type === "GetSceneList") return { scenes: [{ sceneName: sceneName() }] };
-    if (request.type === "RemoveScene") return {};
+    if (request.type === "RemoveInput") {
+      inputRemoved = true;
+      return {};
+    }
+    if (request.type === "GetSceneList") return { scenes: sceneRemoved ? [] : [{ sceneName: sceneName() }] };
+    if (request.type === "RemoveScene") {
+      sceneRemoved = true;
+      return {};
+    }
     throw new Error(`Unexpected cleanup request ${request.type}`);
   });
 }
 
-function temporaryPrimary(hangDisconnect = false): PreviewSocket {
+function emptyVerificationSocket(): PreviewSocket {
+  return new PreviewSocket((request) => {
+    if (request.type === "GetInputList") return { inputs: [] };
+    if (request.type === "GetSceneList") return { scenes: [] };
+    throw new Error(`Unexpected verification request ${request.type}`);
+  });
+}
+
+function temporaryPrimary(
+  hangDisconnect = false,
+  unavailableOutput?: "GetReplayBufferStatus" | "GetVirtualCamStatus",
+): PreviewSocket {
   return new PreviewSocket((request) => {
     if (request.type === "CreateScene") return { sceneUuid: "temporary-scene-uuid" };
     if (request.type === "CreateInput") return { inputUuid: "temporary-input-uuid", sceneItemId: 7 };
@@ -589,7 +675,7 @@ function temporaryPrimary(hangDisconnect = false): PreviewSocket {
     if (request.type === "SetCurrentPreviewScene" || request.type === "SetSceneItemEnabled") return {};
     if (request.type === "GetSourceScreenshot") return { imageData: jpegDataUrl(10, 10) };
     throw new Error(`Unexpected temporary primary request ${request.type}`);
-  }, undefined, "program-scene-uuid", hangDisconnect);
+  }, undefined, "program-scene-uuid", hangDisconnect, unavailableOutput);
 }
 
 function nextSocket(sockets: PreviewSocket[]): PreviewSocket {

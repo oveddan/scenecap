@@ -232,7 +232,9 @@ describe("ObsWebSocketAdapter", () => {
     const observed: Array<{ connection: number; requestData?: unknown; requestType: string }> = [];
     let connection = 0;
     let inputName = "";
+    let inputRemoved = false;
     let sceneName = "";
+    let sceneRemoved = false;
     const fakeObs = await startObsServer((socket) => {
       connection += 1;
       const connectionNumber = connection;
@@ -248,6 +250,8 @@ describe("ObsWebSocketAdapter", () => {
         observed.push({ connection: connectionNumber, requestData: incoming.d.requestData, requestType });
         if (requestType === "CreateScene") sceneName = (incoming.d.requestData as { sceneName: string }).sceneName;
         if (requestType === "CreateInput") inputName = (incoming.d.requestData as { inputName: string }).inputName;
+        if (requestType === "RemoveInput") inputRemoved = true;
+        if (requestType === "RemoveScene") sceneRemoved = true;
         const responseData = connectionNumber === 1
           ? requestType === "GetInputList"
             ? { inputs: [{ inputKind: "screen_capture", inputName: "Probe", inputUuid: "configured-uuid" }] }
@@ -280,11 +284,17 @@ describe("ObsWebSocketAdapter", () => {
                 : requestType === "GetStudioModeEnabled"
                   ? { studioModeEnabled: false }
                   : requestType === "GetInputList"
-                ? { inputs: [{ inputName, inputUuid: "temporary-input-uuid" }] }
+                ? { inputs: inputRemoved ? [] : [{ inputName, inputUuid: "temporary-input-uuid" }] }
                 : requestType === "GetSceneList"
-                  ? { scenes: [{ sceneName }] }
+                  ? { scenes: sceneRemoved ? [] : [{ sceneName }] }
                   : ["SetSceneItemEnabled", "SetCurrentPreviewScene", "SetStudioModeEnabled", "RemoveInput", "RemoveScene"].includes(requestType)
                     ? {}
+                    : undefined
+              : connectionNumber === 4
+                ? requestType === "GetInputList"
+                  ? { inputs: inputRemoved ? [] : [{ inputName, inputUuid: "temporary-input-uuid" }] }
+                  : requestType === "GetSceneList"
+                    ? { scenes: sceneRemoved ? [] : [{ sceneName }] }
                     : undefined
               : undefined;
         if (responseData === undefined) throw new Error(`Unexpected OBS request: ${requestType}`);
@@ -328,13 +338,15 @@ describe("ObsWebSocketAdapter", () => {
       "GetSourceScreenshot",
       "GetCurrentProgramScene",
       "GetStudioModeEnabled",
-      "GetInputList",
       "RemoveInput",
-      "GetSceneList",
       "RemoveScene",
+      "GetInputList",
+      "GetSceneList",
     ]);
     expect(observed.map((request) => request.requestType)).not.toContain("SetCurrentProgramScene");
     expect(JSON.stringify(observed)).not.toContain("source_record");
+    expect(observed.filter((request) => request.connection === 4).map((request) => request.requestType))
+      .toEqual(["GetInputList", "GetSceneList"]);
     expect(observed.find((request) => request.requestType === "SetCurrentPreviewScene" && request.connection === 2))
       .toMatchObject({ requestData: { sceneUuid: "temporary-scene-uuid" } });
   });
