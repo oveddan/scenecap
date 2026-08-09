@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 
-import { encodeCaptureTargetRef, readCaptureTargets } from "../server/capture-targets.js";
+import {
+  decodeCaptureTargetRef,
+  encodeCaptureTargetRef,
+  readCaptureTargets,
+} from "../server/capture-targets.js";
 import type {
   ObsConnectionOptions,
   ObsReadRequest,
+  ObsRequest,
   ObsSocket,
 } from "../server/obs.js";
 
@@ -62,6 +67,16 @@ class DiscoverySocket implements ObsSocket {
 }
 
 describe("readCaptureTargets", () => {
+  it("strictly decodes only canonical bounded opaque target references", () => {
+    expect(decodeCaptureTargetRef(encodeCaptureTargetRef("window", 0xffff_ffff))).toEqual({
+      kind: "window",
+      value: 0xffff_ffff,
+    });
+    expect(decodeCaptureTargetRef(encodeCaptureTargetRef("window", 0))).toBeUndefined();
+    expect(decodeCaptureTargetRef(encodeCaptureTargetRef("display", "\u0000"))).toBeUndefined();
+    expect(decodeCaptureTargetRef("scenecap-target-v1.eyJraW5kIjoid2luZG93In0")).toBeUndefined();
+  });
+
   it("lists only curated capture targets with stable typed references", async () => {
     const socket = new DiscoverySocket();
     const result = await readCaptureTargets(
@@ -133,7 +148,7 @@ describe("readCaptureTargets", () => {
   });
 
   it("reports structured setup limitations instead of mutating OBS to create probes", async () => {
-    const requests: ObsReadRequest[] = [];
+    const requests: ObsRequest[] = [];
     const socket: ObsSocket = {
       async connect() {},
       async request(request) {

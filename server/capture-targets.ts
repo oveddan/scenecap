@@ -18,6 +18,13 @@ export const DEFAULT_CAPTURE_TARGET_DISCOVERY_TIMEOUT_MS = 20_000;
 
 export type CaptureTargetKind = "application" | "camera" | "display" | "window";
 
+export type CaptureTargetValue = number | string;
+
+export interface DecodedCaptureTargetRef {
+  kind: CaptureTargetKind;
+  value: CaptureTargetValue;
+}
+
 export interface CaptureSource {
   configuredTargetRef?: string;
   inputKind: string;
@@ -277,7 +284,11 @@ function parseInputs(response: unknown): ObsInput[] {
 }
 
 function isSupportedCaptureInput(input: ObsInput): boolean {
-  return input.inputKind === "screen_capture" || CAMERA_INPUT_KINDS.has(input.inputKind);
+  return isSupportedCaptureInputKind(input.inputKind);
+}
+
+function isSupportedCaptureInputKind(inputKind: string): boolean {
+  return inputKind === "screen_capture" || CAMERA_INPUT_KINDS.has(inputKind);
 }
 
 function screenProbeGroups(inputs: InputSnapshot[]): InputSnapshot[][] {
@@ -328,9 +339,7 @@ function toConfiguredCaptureTarget(input: InputSnapshot): CaptureTarget[] {
   }];
 }
 
-function configuredTarget(
-  input: InputSnapshot,
-): { kind: CaptureTargetKind; value: number | string } | undefined {
+function configuredTarget(input: InputSnapshot): DecodedCaptureTargetRef | undefined {
   if (input.inputKind === "screen_capture") {
     const captureType = input.settings.type === undefined ? 0 : input.settings.type;
     const selection = captureType === 0
@@ -340,13 +349,13 @@ function configuredTarget(
         : captureType === 2
           ? { kind: "application" as const, value: targetValue(input.settings.application) }
           : undefined;
-    return selection?.value === undefined || selection.value === "" || selection.value === 0
+    return selection?.value === undefined || !isValidTargetValue(selection.kind, selection.value)
       ? undefined
       : { kind: selection.kind, value: selection.value };
   }
   if (CAMERA_INPUT_KINDS.has(input.inputKind)) {
     const value = targetValue(input.settings.device);
-    return value === undefined || value === "" || value === 0 ? undefined : { kind: "camera", value };
+    return value === undefined || !isValidTargetValue("camera", value) ? undefined : { kind: "camera", value };
   }
   return undefined;
 }
@@ -381,12 +390,63 @@ function boundAndDedupeTargets(targets: CaptureTarget[]): {
   return { boundedTargets, truncatedKinds: [...truncatedKinds] };
 }
 
-export function encodeCaptureTargetRef(kind: CaptureTargetKind, value: number | string): string {
+export function encodeCaptureTargetRef(kind: CaptureTargetKind, value: CaptureTargetValue): string {
   return `scenecap-target-v1.${Buffer.from(JSON.stringify([kind, value])).toString("base64url")}`;
 }
 
-function encodeInputRef(inputUuid: string): string {
+export function decodeCaptureTargetRef(reference: string): DecodedCaptureTargetRef | undefined {
+  const encoded = reference.startsWith("scenecap-target-v1.")
+    ? reference.slice("scenecap-target-v1.".length)
+    : undefined;
+  if (!encoded || encoded.length > 2_000 || !/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(decoded) || decoded.length !== 2) return undefined;
+  const [kind, value] = decoded;
+  if (!isCaptureTargetKind(kind) || !isValidTargetValue(kind, value)) return undefined;
+  const parsed = { kind, value } satisfies DecodedCaptureTargetRef;
+  // Reject aliases, malformed UTF-8, and extra non-canonical encodings. A
+  // preview request must name precisely a reference this server could emit.
+  return encodeCaptureTargetRef(parsed.kind, parsed.value) === reference ? parsed : undefined;
+}
+
+export function encodeInputRef(inputUuid: string): string {
   return `scenecap-input-v1.${Buffer.from(inputUuid).toString("base64url")}`;
+}
+
+export function decodeInputRef(reference: string): string | undefined {
+  const encoded = reference.startsWith("scenecap-input-v1.")
+    ? reference.slice("scenecap-input-v1.".length)
+    : undefined;
+  if (!encoded || encoded.length > 1_000 || !/^[A-Za-z0-9_-]+$/.test(encoded)) return undefined;
+  const value = Buffer.from(encoded, "base64url").toString("utf8");
+  if (!value || value.length > 300 || hasControlCharacter(value)) return undefined;
+  return encodeInputRef(value) === reference ? value : undefined;
+}
+
+function isCaptureTargetKind(value: unknown): value is CaptureTargetKind {
+  return value === "application" || value === "camera" || value === "display" || value === "window";
+}
+
+function isValidTargetValue(kind: CaptureTargetKind, value: unknown): value is CaptureTargetValue {
+  if (kind === "window") {
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 0xffff_ffff;
+  }
+  return typeof value === "string"
+    && value.length > 0
+    && Buffer.byteLength(value, "utf8") <= 300
+    && !hasControlCharacter(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  return [...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint < 32 || codePoint === 127;
+  });
 }
 
 function targetValue(value: unknown): number | string | undefined {
