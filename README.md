@@ -55,6 +55,17 @@ fragmented MP4, or fragmented MOV), and intended output dimensions. It does
 not alter camera presets or scene transforms, which could crop, distort, or
 select an unsupported device mode.
 
+`start_recording` explicitly starts OBS's global recording only when the
+sidecar has at least one complete configured source and a fresh discovery
+still matches every stored source/target pair. It will not adopt an OBS
+recording started elsewhere. `stop_recording` only stops that sidecar-owned
+recording, then reports OBS's global completed output path and whether the
+file is currently visible on disk. A timeout, cancellation, lost OBS response,
+or contradictory status becomes an explicit ambiguous session state and blocks
+further recording mutations until an operator inspects OBS. These tools do not
+configure, infer, or report Source Record plugin outputs; that remains a
+separate per-source settings extension.
+
 On OBS 32.2.1 for macOS, `GetInputPropertiesListPropertyItems` can crash OBS
 when called with only an input UUID, or when obs-websocket serializes some
 dynamic string-valued capture lists. Scenecap therefore sends the current
@@ -208,10 +219,14 @@ when an OBS source has an odd or otherwise unsupported size.
   fails after OBS accepted a target update, the tool records a partial state
   and requires inspection before retrying rather than assuming OBS reverted
   it.
-- Future recording mutation tools will snapshot temporary OBS state before
-  changing it and restore it on request or safe cleanup.
-- Future recording tools will report the final output path and, when
-  configured, use `ffprobe` only to validate the completed file—not to capture
-  or encode it.
+- Recording controls serialize across every MCP client in the singleton
+  sidecar. They revalidate configured inputs before starting, do not adopt an
+  externally active OBS recording, and leave uncertain transitions blocked for
+  manual OBS inspection rather than retrying a possibly delivered mutation.
+  `stop_recording` reports only OBS's global output path; Source Record output
+  paths are not inferred by recording controls even when a configured source
+  has a Source Record filter.
+- `ffprobe` remains an optional future validator for an existing completed
+  file—not a capture or encoding dependency.
 
 See [PLAN.md](PLAN.md) for the migration milestones.

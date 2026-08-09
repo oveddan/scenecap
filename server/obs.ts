@@ -139,7 +139,12 @@ export type ObsSourceRecordRequest =
       type: "SetSourceFilterEnabled";
     };
 
-export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest | ObsSourceRecordRequest;
+/** Recording controls deliberately expose no output-profile/settings input. */
+export type ObsRecordingRequest =
+  | { type: "StartRecord" }
+  | { type: "StopRecord" };
+
+export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest | ObsSourceRecordRequest | ObsRecordingRequest;
 
 export interface ObsSocket {
   connect(options: ObsConnectionOptions): Promise<void>;
@@ -236,6 +241,10 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("SetSourceFilterSettings", request.data);
       case "SetSourceFilterEnabled":
         return this.#socket.call("SetSourceFilterEnabled", request.data);
+      case "StartRecord":
+        return this.#socket.call("StartRecord");
+      case "StopRecord":
+        return this.#socket.call("StopRecord");
     }
   }
 

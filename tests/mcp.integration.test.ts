@@ -51,6 +51,8 @@ describe("MCP HTTP sidecar", () => {
     expect(tools.tools.map((tool) => tool.name)).toEqual([
       "get_session",
       "configure_capture_target",
+      "start_recording",
+      "stop_recording",
       "get_status",
       "list_capture_targets",
       "preview_capture_target",

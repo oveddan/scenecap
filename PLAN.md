@@ -85,8 +85,10 @@ Then introduce narrow tools in this order:
    express intended capture outputs including a phone camera and multi-display
    capture. Configure an owned per-source Source Record filter with inherited
    OBS-profile defaults and bounded output overrides.
-4. `start_recording` and `stop_recording` — explicit recording mutations with
-   ownership and output reporting.
+4. `start_recording` and `stop_recording` — explicit global OBS recording
+   mutations with sidecar ownership, source revalidation, fail-closed
+   ambiguous-transition handling, and global output-path reporting. They do
+   not require or infer per-source Source Record outputs.
 5. `restore_obs_state` — restore a snapshot after temporary configuration.
 
 Source configuration applies encoder-safe aligned dimensions only to its
