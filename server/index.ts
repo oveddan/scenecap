@@ -1,11 +1,15 @@
 import { loadServerConfig } from "./config.js";
+import { CaptureSessionStore } from "./capture-session.js";
 import { McpHttpSidecar } from "./http.js";
 import { createMcpServer } from "./mcp.js";
 import { ProcessSingleton } from "./singleton.js";
 
 const config = loadServerConfig();
+// HTTP creates one McpServer per client session. Keep configuration state in
+// this process-owned store so all of those sessions see the same atomic view.
+const captureSessionStore = new CaptureSessionStore();
 const sidecar = new McpHttpSidecar(config, {
-  createMcpServer: () => createMcpServer(config),
+  createMcpServer: () => createMcpServer(config, undefined, undefined, captureSessionStore),
 });
 const singleton = new ProcessSingleton();
 

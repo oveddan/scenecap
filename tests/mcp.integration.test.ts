@@ -6,6 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { afterEach, describe, expect, it } from "vitest";
 
 import { ConfigError, type SidecarConfig } from "../server/config.js";
+import { CaptureSessionStore } from "../server/capture-session.js";
 import { McpHttpSidecar, type McpHttpSidecarOptions } from "../server/http.js";
 import { createMcpServer } from "../server/mcp.js";
 import type { ObsConnectionOptions, ObsReadRequest, ObsRequest, ObsSocket } from "../server/obs.js";
@@ -48,10 +49,24 @@ describe("MCP HTTP sidecar", () => {
     await client.connect(transport);
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toEqual([
+      "get_session",
+      "configure_capture_target",
       "get_status",
       "list_capture_targets",
       "preview_capture_target",
     ]);
+
+    const sessionResult = await client.callTool({ name: "get_session", arguments: {} }) as {
+      content?: Array<{ text?: string; type: string }>;
+      isError?: boolean;
+    };
+    expect(sessionResult.isError).not.toBe(true);
+    expect(JSON.stringify(sessionResult)).not.toContain("integration-secret");
+    const sessionText = sessionResult.content?.[0]?.type === "text" ? sessionResult.content[0].text : undefined;
+    expect(JSON.parse(sessionText ?? "{}")).toMatchObject({
+      session: { configuredSources: [], revision: 0, sessionId: expect.any(String) },
+      status: "ok",
+    });
 
     const result = await client.callTool({ name: "get_status", arguments: {} });
     expect(result.isError).not.toBe(true);
@@ -150,7 +165,13 @@ describe("MCP HTTP sidecar", () => {
   });
 
   it("keeps concurrent MCP sessions independent", async () => {
-    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => new FakeObsSocket()));
+    const captureSessionStore = new CaptureSessionStore();
+    const sidecar = await startSidecar(() => createMcpServer(
+      configFor(0),
+      () => new FakeObsSocket(),
+      undefined,
+      captureSessionStore,
+    ));
     const port = sidecar.listeningPort;
     if (!port) throw new Error("Sidecar did not expose a listening port.");
     const endpoint = new URL(`http://127.0.0.1:${port}/mcp`);
@@ -165,6 +186,11 @@ describe("MCP HTTP sidecar", () => {
       expect.objectContaining({ tools: expect.arrayContaining([expect.objectContaining({ name: "get_status" })]) }),
       expect.objectContaining({ tools: expect.arrayContaining([expect.objectContaining({ name: "get_status" })]) }),
     ]);
+    const [firstSession, secondSession] = await Promise.all([
+      first.callTool({ name: "get_session", arguments: {} }),
+      second.callTool({ name: "get_session", arguments: {} }),
+    ]);
+    expect(sessionIdFromResult(firstSession)).toBe(sessionIdFromResult(secondSession));
     await Promise.all([first.close(), second.close()]);
   });
 
@@ -347,6 +373,72 @@ describe("MCP HTTP sidecar", () => {
     expect(metadata?.text).not.toContain("integration-secret");
     await client.close();
   });
+
+  it("persists one configured source into the shared get_session contract without exposing credentials", async () => {
+    const discovery = new PreviewFakeObsSocket((request) => {
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Screen", inputUuid: "screen-input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
+      if (request.type === "GetInputPropertiesListPropertyItems") {
+        return { propertyItems: [{ itemEnabled: true, itemName: "Terminal", itemValue: 42 }] };
+      }
+      throw new Error(`Unexpected discovery request ${request.type}`);
+    });
+    const mutation = new PreviewFakeObsSocket((request) => {
+      if (request.type === "GetCurrentProgramScene") {
+        return { currentProgramSceneName: "Record", currentProgramSceneUuid: "record-uuid" };
+      }
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Screen", inputUuid: "screen-input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
+      if (request.type === "SetInputSettings") return {};
+      if (request.type === "GetSceneItemList") return { sceneItems: [{ sceneItemId: 5, sourceUuid: "screen-input-uuid" }] };
+      throw new Error(`Unexpected mutation request ${request.type}`);
+    });
+    const sockets = [discovery, mutation];
+    const store = new CaptureSessionStore();
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => {
+      const socket = sockets.shift();
+      if (!socket) throw new Error("Unexpected extra OBS connection");
+      return socket;
+    }, undefined, store));
+    const client = await connectClient(sidecar, "configuration-test");
+    const targetRef = "scenecap-target-v1.WyJ3aW5kb3ciLDQyXQ";
+    const sourceRef = "scenecap-input-v1.c2NyZWVuLWlucHV0LXV1aWQ";
+
+    const configured = await client.callTool({
+      arguments: { encoderDimensions: { height: 1_081, width: 1_919 }, sourceRef, targetRef },
+      name: "configure_capture_target",
+    });
+    expect(configured.isError).not.toBe(true);
+    expect(JSON.stringify(configured)).not.toContain("integration-secret");
+    expect(JSON.parse((configured as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "{}")).toMatchObject({
+      configuredSource: {
+        configurationState: "configured",
+        encoderSafeDimensions: { adjusted: true, alignment: 2, height: 1_082, width: 1_920 },
+        scene: { sceneName: "Record", sceneUuid: "record-uuid" },
+        source: { configuredTargetRef: targetRef, sourceRef },
+      },
+      session: { configuredSources: [expect.any(Object)], revision: 1 },
+      status: "ok",
+    });
+    const session = await client.callTool({ arguments: {}, name: "get_session" });
+    const sessionText = (session as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "{}";
+    expect(sessionText).not.toContain("previousInputSettings");
+    expect(sessionText).not.toContain("restoreSnapshot");
+    expect(JSON.parse(sessionText)).toMatchObject({
+      session: {
+        configuredSources: [expect.objectContaining({
+          encoderSafeDimensions: { adjusted: true, alignment: 2, height: 1_082, width: 1_920 },
+          source: expect.objectContaining({ sourceRef }),
+        })],
+        revision: 1,
+      },
+    });
+    await client.close();
+  });
 });
 
 class PreviewFakeObsSocket implements ObsSocket {
@@ -407,6 +499,16 @@ async function getStatus(client: Client): Promise<unknown> {
     throw new Error("Expected a text MCP tool result.");
   }
   return JSON.parse(content.text);
+}
+
+function sessionIdFromResult(result: unknown): string {
+  const content = (result as { content?: Array<{ text?: string; type: string }> }).content?.[0];
+  if (!content || content.type !== "text" || !content.text) {
+    throw new Error("Expected a text MCP session result.");
+  }
+  const sessionId = (JSON.parse(content.text) as { session?: { sessionId?: unknown } }).session?.sessionId;
+  if (typeof sessionId !== "string") throw new Error("Expected a capture session ID.");
+  return sessionId;
 }
 
 function singleHeader(headers: IncomingHttpHeaders, name: string): string | undefined {
