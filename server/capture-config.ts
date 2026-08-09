@@ -28,6 +28,13 @@ import {
   type ObsSocket,
   type ObsSocketFactory,
 } from "./obs.js";
+import {
+  configureSourceRecordFilter,
+  ensureSourceRecordCapability,
+  SourceRecordConfigurationError,
+  type SourceRecordConfiguration,
+  type SourceRecordOptions,
+} from "./source-record.js";
 
 export const DEFAULT_CAPTURE_CONFIGURATION_TIMEOUT_MS = 20_000;
 export const CAPTURE_CONFIGURATION_RECOVERY_TIMEOUT_MS = 5_000;
@@ -60,6 +67,8 @@ export interface ConfigureCaptureTargetRequest {
    * normalized intent when it configures the per-source recording encoder.
    */
   encoderDimensions?: EncoderDimensions;
+  /** Portable Source Record overrides; encoder-specific tuning is intentionally excluded. */
+  recording?: Omit<SourceRecordOptions, "encoderDimensions">;
 }
 
 export interface EncoderSafeDimensions extends EncoderDimensions {
@@ -71,12 +80,14 @@ export interface CaptureTargetConfiguration {
   configuredSource: ConfiguredCaptureSource;
   encoderSafeDimensions?: EncoderSafeDimensions;
   restoreSnapshot: CaptureSessionRestoreSnapshot;
+  sourceRecord: SourceRecordConfiguration;
 }
 
 export type CaptureConfigurationErrorKind =
   | "incompatible_source"
   | "invalid_reference"
   | "invalid_request"
+  | "source_record_unavailable"
   | "source_unavailable"
   | "stale_reference";
 
@@ -94,8 +105,8 @@ export class CaptureConfigurationError extends Error {
  */
 export class CaptureConfigurationPartialError extends CaptureConfigurationError {
   constructor(
-    readonly configuration: Omit<CaptureTargetConfiguration, "encoderSafeDimensions">,
-    readonly outcome: "scene_attachment_rejected" | "unknown",
+    readonly configuration: Omit<CaptureTargetConfiguration, "encoderSafeDimensions" | "sourceRecord">,
+    readonly outcome: "scene_attachment_rejected" | "source_record_filter_rejected" | "unknown",
   ) {
     super("source_unavailable", "OBS capture configuration is only partially applied.");
     this.name = "CaptureConfigurationPartialError";
@@ -156,6 +167,16 @@ export async function configureCaptureTarget(
   const socket = createSocket();
   try {
     await connect(socket, config, options, deadline);
+    // Probe the plugin before changing the capture source.  A missing plugin
+    // must leave OBS completely untouched.
+    try {
+      await ensureSourceRecordCapability(socket, options, deadline);
+    } catch (error) {
+      if (error instanceof SourceRecordConfigurationError) {
+        throw new CaptureConfigurationError("source_record_unavailable", "Source Record is not available in OBS.");
+      }
+      throw error;
+    }
     const scene = await resolveScene(socket, request.sceneName, options, deadline);
     const operation = request.sourceRef
       ? await updateExistingInput(socket, request.sourceRef, target, scene, options, deadline)
@@ -171,13 +192,36 @@ export async function configureCaptureTarget(
       );
     const { restoreSnapshot, ...configuredSource } = operation;
     const encoderSafeDimensions = request.encoderDimensions ? alignEncoderDimensions(request.encoderDimensions) : undefined;
+    const configuredSourceWithDimensions = {
+      ...configuredSource,
+      ...(encoderSafeDimensions ? { encoderSafeDimensions } : {}),
+    };
+    let sourceRecord: SourceRecordConfiguration;
+    try {
+      const inputUuid = decodeInputRef(configuredSource.source.sourceRef);
+      if (!inputUuid) throw new CaptureConfigurationError("source_unavailable", "OBS did not return a usable configured source identity.");
+      sourceRecord = await configureSourceRecordFilter(socket, {
+        inputName: configuredSource.source.inputName,
+        inputUuid,
+      }, {
+        ...request.recording,
+        ...(request.encoderDimensions ? { encoderDimensions: request.encoderDimensions } : {}),
+      }, options, deadline);
+    } catch (error) {
+      if (error instanceof SourceRecordConfigurationError) {
+        throw partialSourceRecordConfiguration(
+          configuredSourceWithDimensions,
+          restoreSnapshot,
+          error.kind === "mutation_rejected" ? "source_record_filter_rejected" : "unknown",
+        );
+      }
+      throw error;
+    }
     return {
-      configuredSource: {
-        ...configuredSource,
-        ...(encoderSafeDimensions ? { encoderSafeDimensions } : {}),
-      },
+      configuredSource: { ...configuredSourceWithDimensions, sourceRecord },
       ...(encoderSafeDimensions ? { encoderSafeDimensions } : {}),
       restoreSnapshot,
+      sourceRecord,
     };
   } finally {
     void Promise.resolve(socket.disconnect()).catch(() => undefined);
@@ -492,6 +536,12 @@ function validateRequest(request: ConfigureCaptureTargetRequest): void {
     throw new CaptureConfigurationError("invalid_request", "The target OBS scene name is invalid.");
   }
   if (request.encoderDimensions) alignEncoderDimensions(request.encoderDimensions);
+  if (request.recording?.outputDirectory !== undefined && !isSafeAbsolutePath(request.recording.outputDirectory)) {
+    throw new CaptureConfigurationError("invalid_request", "The Source Record output directory must be an absolute path without control characters.");
+  }
+  if (request.recording?.filenameTemplate !== undefined && !isSafeTemplate(request.recording.filenameTemplate)) {
+    throw new CaptureConfigurationError("invalid_request", "The Source Record filename template is invalid.");
+  }
 }
 
 function targetSettings(target: Pick<CaptureTarget, "kind" | "targetRef"> | DecodedCaptureTargetRef): Record<string, number | string> {
@@ -542,7 +592,7 @@ function partialConfiguration(
   target: CaptureTarget,
   scene: CaptureSessionScene,
   previousTarget: DecodedCaptureTargetRef | undefined,
-  outcome: "scene_attachment_rejected" | "unknown",
+  outcome: "scene_attachment_rejected" | "source_record_filter_rejected" | "unknown",
   sceneItem: CaptureSessionRecovery["sceneItem"],
 ): CaptureConfigurationPartialError {
   const recovery: CaptureSessionRecovery = {
@@ -557,6 +607,21 @@ function partialConfiguration(
       configuredSourceRef: source.sourceRef,
       previousInputSettings: previousTarget ? targetSettings(previousTarget) : undefined,
     },
+  }, outcome);
+}
+
+function partialSourceRecordConfiguration(
+  configuredSource: ConfiguredCaptureSource,
+  restoreSnapshot: CaptureSessionRestoreSnapshot,
+  outcome: "source_record_filter_rejected" | "unknown",
+): CaptureConfigurationPartialError {
+  return new CaptureConfigurationPartialError({
+    configuredSource: {
+      ...configuredSource,
+      configurationState: "partial_recovery_required",
+      recovery: { ...configuredSource.recovery, mutationOutcome: outcome },
+    },
+    restoreSnapshot,
   }, outcome);
 }
 
@@ -615,6 +680,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isSafeObsName(value: string): boolean {
   return value.length > 0 && value.length <= 300 && ![...value].some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint < 32 || codePoint === 127;
+  });
+}
+
+function isSafeAbsolutePath(value: string): boolean {
+  return value.length > 0 && value.length <= 500 && value.startsWith("/") && !hasControlCharacter(value);
+}
+
+function isSafeTemplate(value: string): boolean {
+  return value.length > 0 && value.length <= 300 && !hasControlCharacter(value);
+}
+
+function hasControlCharacter(value: string): boolean {
+  return [...value].some((character) => {
     const codePoint = character.codePointAt(0) ?? 0;
     return codePoint < 32 || codePoint === 127;
   });

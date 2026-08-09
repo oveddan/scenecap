@@ -55,6 +55,7 @@ describe("configureCaptureTarget", () => {
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
       }
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetInputList") {
         return { inputs: [{ inputKind: "screen_capture", inputName: "Screen", inputUuid: "screen-input-uuid" }] };
       }
@@ -62,6 +63,8 @@ describe("configureCaptureTarget", () => {
       if (request.type === "SetInputSettings") return {};
       if (request.type === "GetSceneItemList") return { sceneItems: [] };
       if (request.type === "CreateSceneItem") return { sceneItemId: 17 };
+      if (request.type === "GetSourceFilterList") return { filters: [] };
+      if (request.type === "CreateSourceFilter") return {};
       throw new Error(`Unexpected configuration request ${request.type}`);
     });
     const sockets = [discovery, mutation];
@@ -85,12 +88,15 @@ describe("configureCaptureTarget", () => {
       sceneItemId: 17,
     });
     expect(mutation.requests).toEqual([
+      { type: "GetSourceFilterKindList" },
       { type: "GetCurrentProgramScene" },
       { type: "GetInputList" },
       { data: { inputName: "Screen" }, type: "GetInputSettings" },
       { data: { inputName: "Screen", inputSettings: { type: 1, window: 42 }, overlay: true }, type: "SetInputSettings" },
       { data: { sceneName: "Record" }, type: "GetSceneItemList" },
       { data: { sceneName: "Record", sourceName: "Screen" }, type: "CreateSceneItem" },
+      { data: { sourceName: "Screen" }, type: "GetSourceFilterList" },
+      expect.objectContaining({ type: "CreateSourceFilter" }),
     ]);
     expect(mutation.disconnected).toBe(true);
   });
@@ -104,9 +110,12 @@ describe("configureCaptureTarget", () => {
       configuredCamera: "phone-camera-device",
     });
     const mutation = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetSceneList") return { scenes: [{ sceneName: "Devices", sceneUuid: "devices-uuid" }] };
       if (request.type === "GetInputList") return { inputs: [] };
       if (request.type === "CreateInput") return { inputUuid: "phone-input-uuid", sceneItemId: 7 };
+      if (request.type === "GetSourceFilterList") return { filters: [] };
+      if (request.type === "CreateSourceFilter") return {};
       throw new Error(`Unexpected configuration request ${request.type}`);
     });
     const sockets = [discovery, mutation];
@@ -132,6 +141,7 @@ describe("configureCaptureTarget", () => {
       encoderSafeDimensions: { adjusted: true, alignment: 2, height: 1_082, width: 1_920 },
     });
     expect(mutation.requests).toEqual([
+      { type: "GetSourceFilterKindList" },
       { type: "GetSceneList" },
       { type: "GetInputList" },
       {
@@ -144,6 +154,8 @@ describe("configureCaptureTarget", () => {
         },
         type: "CreateInput",
       },
+      { data: { sourceName: "Phone" }, type: "GetSourceFilterList" },
+      expect.objectContaining({ type: "CreateSourceFilter" }),
     ]);
   });
 
@@ -161,6 +173,7 @@ describe("configureCaptureTarget", () => {
     const sourceRef = encodeInputRef("screen-input-uuid");
     const discovery = discoverySocket({ inputName: "Screen", inputUuid: "screen-input-uuid", configuredWindow: 41 });
     const mutation = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
       }
@@ -203,6 +216,7 @@ describe("configureCaptureTarget", () => {
   it("re-queries a fresh OBS connection and tracks an ambiguously created input without guessing deletion ownership", async () => {
     const discovery = discoverySocket({ inputName: "Probe", inputUuid: "probe-uuid", configuredWindow: 41 });
     const primary = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
       }
@@ -245,6 +259,7 @@ describe("configureCaptureTarget", () => {
   it("returns named manual-recovery tracking when a fresh lookup cannot resolve an ambiguous creation", async () => {
     const discovery = discoverySocket({ inputName: "Probe", inputUuid: "probe-uuid", configuredWindow: 41 });
     const primary = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
       }
@@ -275,6 +290,7 @@ describe("configureCaptureTarget", () => {
     const sourceRef = encodeInputRef("screen-input-uuid");
     const discovery = discoverySocket({ inputName: "Screen", inputUuid: "screen-input-uuid", configuredWindow: 41 });
     const mutation = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
       }
@@ -284,6 +300,8 @@ describe("configureCaptureTarget", () => {
       if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
       if (request.type === "SetInputSettings") return {};
       if (request.type === "GetSceneItemList") return { sceneItems: [{ sceneItemId: 8, sourceUuid: "screen-input-uuid" }] };
+      if (request.type === "GetSourceFilterList") return { filters: [] };
+      if (request.type === "CreateSourceFilter") return {};
       throw new Error(`Unexpected configuration request ${request.type}`);
     });
     const sockets = [discovery, mutation];
@@ -293,6 +311,47 @@ describe("configureCaptureTarget", () => {
 
     expect(JSON.stringify({ result, session: store.read() })).not.toContain(config.password);
     expect(mutation.connectedWith?.password).toBe(config.password);
+  });
+
+  it("retains a capture recovery snapshot when Source Record filter lookup fails", async () => {
+    const sourceRef = encodeInputRef("screen-input-uuid");
+    const discovery = discoverySocket({ inputName: "Screen", inputUuid: "screen-input-uuid", configuredWindow: 41 });
+    const mutation = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
+      if (request.type === "GetCurrentProgramScene") {
+        return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
+      }
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Screen", inputUuid: "screen-input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
+      if (request.type === "SetInputSettings") return {};
+      if (request.type === "GetSceneItemList") return { sceneItems: [{ sceneItemId: 8, sourceUuid: "screen-input-uuid" }] };
+      if (request.type === "GetSourceFilterList") throw new Error("socket closed during filter lookup");
+      throw new Error(`Unexpected configuration request ${request.type}`);
+    });
+    const sockets = [discovery, mutation];
+
+    const partial = await configureCaptureTarget(config, { sourceRef, targetRef: windowTargetRef }, () => nextSocket(sockets))
+      .catch((error: unknown) => error);
+
+    expect(partial).toBeInstanceOf(CaptureConfigurationPartialError);
+    expect(partial).toMatchObject({
+      configuration: {
+        configuredSource: {
+          configurationState: "partial_recovery_required",
+          recovery: { input: "restore_previous_target", mutationOutcome: "unknown" },
+          source: { sourceRef },
+        },
+        restoreSnapshot: {
+          configuredSourceRef: sourceRef,
+          previousInputSettings: { type: 1, window: 41 },
+          sceneItemId: 8,
+        },
+      },
+      outcome: "unknown",
+    });
+    expect(JSON.stringify(partial)).not.toContain(config.password);
   });
 });
 

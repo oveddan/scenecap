@@ -65,6 +65,11 @@ export function createMcpServer(
           width: z.number().int().min(1).max(16_384),
           height: z.number().int().min(1).max(16_384),
         }).strict().optional(),
+        recording: z.object({
+          outputDirectory: z.string().min(1).max(500).optional(),
+          filenameTemplate: z.string().min(1).max(300).optional(),
+          format: z.enum(["mkv", "fragmented_mp4", "fragmented_mov"]).optional(),
+        }).strict().optional(),
       },
       annotations: {
         destructiveHint: true,
@@ -106,6 +111,7 @@ export function createMcpServer(
                 ...(result.configuration.encoderSafeDimensions
                   ? { encoderSafeDimensions: result.configuration.encoderSafeDimensions }
                   : {}),
+                sourceRecord: result.configuration.sourceRecord,
                 server: SERVER_INFO,
                 session: result.session,
                 status: "ok",
@@ -287,6 +293,8 @@ export function curatedCaptureConfigurationFailureReason(error: unknown): string
   if (error instanceof CaptureConfigurationPartialError) {
     return error.outcome === "scene_attachment_rejected"
       ? "OBS updated the capture target but rejected adding it to the scene; inspect get_session before retrying."
+      : error.outcome === "source_record_filter_rejected"
+        ? "OBS configured the capture target but rejected its Source Record filter; inspect get_session before retrying."
       : "OBS configuration may be partially applied; inspect get_session before retrying or restoring it manually.";
   }
   if (error instanceof CaptureConfigurationError) {
@@ -297,6 +305,8 @@ export function curatedCaptureConfigurationFailureReason(error: unknown): string
         return "The capture target or source reference is invalid.";
       case "invalid_request":
         return "The capture configuration request is invalid.";
+      case "source_record_unavailable":
+        return "The Source Record filter is unavailable in OBS; install or enable it before configuring a recording target.";
       case "source_unavailable":
         return "The requested OBS source or scene is no longer available; list targets again.";
       case "stale_reference":

@@ -45,9 +45,15 @@ configuration session: a stable session ID, revision, configured source and
 target references, scene identities, and a non-secret recovery summary. This
 is the cross-client contract for later recording and restoration tools. When
 an intended output size is supplied, configuration rounds it up to an even
-encoder-safe size and records that intent. It does not alter camera presets or
-scene transforms, which could crop, distort, or select an unsupported device
-mode; per-source Source Record configuration will apply that intent later.
+encoder-safe size and applies it only to that source's Source Record encoder.
+Each configured source receives a uniquely owned `source_record_filter` set to
+record when OBS recording starts. By default it inherits the current OBS
+profile's encoder, container, and output path; scenecap does not guess
+hardware-specific encoder tuning. A caller may safely override an absolute
+output directory, filename template, crash-resilient container (`mkv`,
+fragmented MP4, or fragmented MOV), and intended output dimensions. It does
+not alter camera presets or scene transforms, which could crop, distort, or
+select an unsupported device mode.
 
 On OBS 32.2.1 for macOS, `GetInputPropertiesListPropertyItems` can crash OBS
 when called with only an input UUID, or when obs-websocket serializes some
@@ -195,9 +201,13 @@ when an OBS source has an odd or otherwise unsupported size.
 - `configure_capture_target` accepts only discovered opaque references and
   allowlisted capture kinds; it never passes raw OBS settings through MCP. The
   sidecar retains recovery data privately and `get_session` exposes only a
-  non-secret summary. If a later scene attachment fails after OBS accepted a
-  target update, the tool records a partial state and requires inspection
-  before retrying rather than assuming OBS reverted it.
+  non-secret summary. Its Source Record filter name is derived from the OBS
+  input UUID and is never caller-controlled; a colliding non-Source-Record
+  filter is left untouched. A missing Source Record capability is detected
+  before changing the source. If a later scene attachment or filter mutation
+  fails after OBS accepted a target update, the tool records a partial state
+  and requires inspection before retrying rather than assuming OBS reverted
+  it.
 - Future recording mutation tools will snapshot temporary OBS state before
   changing it and restore it on request or safe cleanup.
 - Future recording tools will report the final output path and, when
