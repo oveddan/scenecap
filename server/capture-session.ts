@@ -51,9 +51,29 @@ export interface UnresolvedCaptureCreation {
 
 export interface CaptureSession {
   configuredSources: ConfiguredCaptureSource[];
+  recording?: RecordingSession;
   revision: number;
   sessionId: string;
   unresolvedCreations: UnresolvedCaptureCreation[];
+}
+
+/**
+ * A recording is owned by this sidecar only after StartRecord has been
+ * confirmed by a separate status read.  Ambiguous states deliberately block
+ * further mutations: reconnecting OBS cannot prove that a timed-out request
+ * did not reach it.
+ */
+export interface RecordingSession {
+  configuredSourceRefs: string[];
+  startedAt: string;
+  state: "active" | "start_ambiguous" | "stop_ambiguous";
+}
+
+export class CaptureSessionMutationError extends Error {
+  constructor() {
+    super("Cannot change capture configuration while a recording transition is active.");
+    this.name = "CaptureSessionMutationError";
+  }
 }
 
 /** Private restoration data retained only by the singleton sidecar. */
@@ -92,6 +112,7 @@ export class CaptureSessionStore {
   }
 
   record(configuration: ConfiguredCaptureSource, restoreSnapshot: CaptureSessionRestoreSnapshot): CaptureSession {
+    this.assertConfigurationMutable();
     const previous = this.#session.configuredSources.find(
       (candidate) => candidate.source.sourceRef === configuration.source.sourceRef,
     );
@@ -119,6 +140,7 @@ export class CaptureSessionStore {
   }
 
   recordUnresolvedCreation(creation: UnresolvedCaptureCreation): CaptureSession {
+    this.assertConfigurationMutable();
     const unresolvedCreations = [
       ...this.#session.unresolvedCreations.filter((candidate) => candidate.inputName !== creation.inputName),
       structuredClone(creation),
@@ -128,6 +150,36 @@ export class CaptureSessionStore {
       revision: this.#session.revision + 1,
       unresolvedCreations,
     };
+    return this.read();
+  }
+
+  beginRecording(): CaptureSession {
+    if (this.#session.recording) throw new Error("A recording transition is already active.");
+    this.#session = {
+      ...this.#session,
+      recording: {
+        configuredSourceRefs: this.#session.configuredSources.map((source) => source.source.sourceRef),
+        startedAt: new Date().toISOString(),
+        state: "start_ambiguous",
+      },
+    };
+    return this.read();
+  }
+
+  assertConfigurationMutable(): void {
+    if (this.#session.recording) throw new CaptureSessionMutationError();
+  }
+
+  setRecordingState(state: RecordingSession["state"]): CaptureSession {
+    if (!this.#session.recording) throw new Error("No recording transition is active.");
+    this.#session = { ...this.#session, recording: { ...this.#session.recording, state } };
+    return this.read();
+  }
+
+  clearRecording(): CaptureSession {
+    const session = { ...this.#session };
+    delete session.recording;
+    this.#session = session;
     return this.read();
   }
 

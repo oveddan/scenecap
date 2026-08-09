@@ -12,10 +12,11 @@ import {
   CapturePreviewError,
   previewCaptureTarget,
 } from "./capture-preview.js";
-import { CaptureSessionStore } from "./capture-session.js";
+import { CaptureSessionMutationError, CaptureSessionStore } from "./capture-session.js";
 import { decodeCaptureTargetRef, readCaptureTargets } from "./capture-targets.js";
 import { ConfigError, loadObsConfig, type ObsConfig, type SidecarConfig } from "./config.js";
 import { classifyObsFailure, readObsStatus, type ObsSocketFactory } from "./obs.js";
+import { RecordingControlError, startRecording, stopRecording } from "./recording.js";
 
 export const SERVER_INFO = { name: "scenecap", version: "0.1.0" } as const;
 
@@ -83,6 +84,10 @@ export function createMcpServer(
       try {
         const result = await sessionStore.runExclusive(async () => {
           try {
+            // This check is intentionally inside the same shared critical
+            // section as configuration and recording transitions. It must run
+            // before configuration opens an OBS socket or sends a mutation.
+            sessionStore.assertConfigurationMutable();
             const configuration = await configureCaptureTarget(
               await loadObs(),
               request,
@@ -135,6 +140,70 @@ export function createMcpServer(
           ],
           isError: true,
         };
+      }
+    },
+  );
+
+  server.registerTool(
+    "start_recording",
+    {
+      title: "Start the configured OBS recording",
+      description:
+        "Explicitly start OBS's global recording only after every sidecar-configured source is still current. This never changes Source Record settings or starts implicitly. A previous uncertain recording mutation requires manual OBS inspection.",
+      annotations: {
+        destructiveHint: true,
+        openWorldHint: false,
+        readOnlyHint: false,
+      },
+    },
+    async (extra) => {
+      try {
+        const recording = await sessionStore.runExclusive(async () => startRecording(
+          await loadObs(),
+          sessionStore,
+          createSocket,
+          { signal: extra.signal },
+        ));
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ recording: recording.recording, server: SERVER_INFO, sessionId: recording.sessionId, status: "ok" }),
+          }],
+        };
+      } catch (error) {
+        return recordingFailureResult(error, "start");
+      }
+    },
+  );
+
+  server.registerTool(
+    "stop_recording",
+    {
+      title: "Stop the sidecar-owned OBS recording",
+      description:
+        "Explicitly stop the active scenecap-owned global OBS recording and report OBS's completed global recording path. Source Record outputs are intentionally not configured or inferred here.",
+      annotations: {
+        destructiveHint: true,
+        openWorldHint: false,
+        readOnlyHint: false,
+      },
+    },
+    async (extra) => {
+      try {
+        const recording = await sessionStore.runExclusive(async () => stopRecording(
+          await loadObs(),
+          sessionStore,
+          createSocket,
+          { signal: extra.signal },
+        ));
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ output: recording.output, server: SERVER_INFO, sessionId: recording.sessionId, status: "ok" }),
+          }],
+        };
+      } catch (error) {
+        return recordingFailureResult(error, "stop");
       }
     },
   );
@@ -287,6 +356,9 @@ export function curatedCaptureTargetFailureReason(error: unknown): string {
 }
 
 export function curatedCaptureConfigurationFailureReason(error: unknown): string {
+  if (error instanceof CaptureSessionMutationError) {
+    return "A recording transition is active; stop or recover it before changing capture configuration.";
+  }
   if (error instanceof CaptureConfigurationAmbiguousCreationError) {
     return "OBS input creation may be partially applied; inspect get_session before retrying or removing the named input manually.";
   }
@@ -320,6 +392,30 @@ export function curatedCaptureConfigurationFailureReason(error: unknown): string
   });
 }
 
+export function curatedRecordingFailureReason(error: unknown, operation: "start" | "stop"): string {
+  if (error instanceof RecordingControlError) {
+    switch (error.kind) {
+      case "already_recording":
+        return "A scenecap-owned recording is already active.";
+      case "ambiguous_recording_state":
+        return "The recording state is uncertain; inspect OBS before trying another recording mutation.";
+      case "no_configured_sources":
+        return "Configure at least one complete capture source before recording.";
+      case "not_recording":
+        return "No scenecap-owned recording is active.";
+      case "recording_owned_elsewhere":
+        return "OBS is already recording outside scenecap; scenecap will not take ownership of it.";
+      case "stale_configuration":
+        return "A configured capture source changed in OBS; configure it again before recording.";
+    }
+  }
+  return curatedObsFailureReason(error, {
+    cancelled: `OBS recording ${operation} was cancelled; inspect OBS before retrying.`,
+    timeout: `OBS recording ${operation} timed out; inspect OBS before retrying.`,
+    unknown: `OBS recording ${operation} failed; inspect OBS before retrying.`,
+  });
+}
+
 export function curatedFailureReason(error: unknown): string {
   return curatedObsFailureReason(error, {
     cancelled: "OBS preflight was cancelled.",
@@ -348,6 +444,20 @@ function previewFailureResult(error: unknown) {
         }),
       },
     ],
+    isError: true,
+  };
+}
+
+function recordingFailureResult(error: unknown, operation: "start" | "stop") {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        reason: curatedRecordingFailureReason(error, operation),
+        server: SERVER_INFO,
+        status: "unavailable",
+      }),
+    }],
     isError: true,
   };
 }
