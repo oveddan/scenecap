@@ -87,6 +87,42 @@ describe("recording controls", () => {
     });
     await expect(startRecording(config, store, () => stale)).rejects.toMatchObject({ kind: "stale_configuration" });
   });
+
+  it("refuses to start when the configured source is no longer attached to its recorded scene", async () => {
+    const store = configuredStore();
+    const detached = configuredDiscoverySocket([]);
+    await expect(startRecording(config, store, () => detached)).rejects.toMatchObject({ kind: "stale_configuration" });
+    expect(detached.requests.map((request) => request.type)).not.toContain("StartRecord");
+  });
+
+  it("revalidates a stored source beyond discovery's per-kind inspection cap", async () => {
+    const store = configuredStore();
+    const inputs = Array.from({ length: 9 }, (_, index) => ({
+      inputKind: "macos-avcapture",
+      inputName: index === 8 ? "Phone" : `Other ${index}`,
+      inputUuid: index === 8 ? "camera-input-uuid" : `other-${index}`,
+    }));
+    const revalidation = new FakeSocket((request) => {
+      if (request.type === "GetInputList") return { inputs };
+      if (request.type === "GetInputSettings") return { inputSettings: { device: "phone-camera" } };
+      if (request.type === "GetSceneItemList") return { sceneItems: [{ sourceUuid: "camera-input-uuid" }] };
+      return unexpected(request);
+    });
+    const start = new FakeSocket(statusSequence(false, undefined, true));
+    const sockets = [revalidation, start];
+    await expect(startRecording(config, store, () => nextSocket(sockets))).resolves.toMatchObject({ recording: { state: "active" } });
+    expect(start.requests.map((request) => request.type)).toContain("StartRecord");
+  });
+
+  it("marks an already-inactive pre-stop output ambiguous before returning", async () => {
+    const store = configuredStore();
+    store.beginRecording();
+    store.setRecordingState("active");
+    const inactive = new FakeSocket((request) => request.type === "GetRecordStatus" ? { outputActive: false } : unexpected(request));
+    await expect(stopRecording(config, store, () => inactive)).rejects.toMatchObject({ kind: "ambiguous_recording_state" });
+    expect(store.read().recording?.state).toBe("stop_ambiguous");
+    expect(inactive.requests).toEqual([{ type: "GetRecordStatus" }]);
+  });
 });
 
 function configuredStore(): CaptureSessionStore {
@@ -101,10 +137,11 @@ function configuredStore(): CaptureSessionStore {
   return store;
 }
 
-function configuredDiscoverySocket(): FakeSocket {
+function configuredDiscoverySocket(sceneItems = [{ sourceUuid: "camera-input-uuid" }]): FakeSocket {
   return new FakeSocket((request) => {
     if (request.type === "GetInputList") return { inputs: [{ inputKind: "macos-avcapture", inputName: "Phone", inputUuid: "camera-input-uuid" }] };
     if (request.type === "GetInputSettings") return { inputSettings: { device: "phone-camera", device_name: "Phone" } };
+    if (request.type === "GetSceneItemList") return { sceneItems };
     return unexpected(request);
   });
 }

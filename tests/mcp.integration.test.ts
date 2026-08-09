@@ -444,6 +444,27 @@ describe("MCP HTTP sidecar", () => {
     });
     await client.close();
   });
+
+  it("rejects configuration before opening an OBS connection while recording is active", async () => {
+    const store = new CaptureSessionStore();
+    store.beginRecording();
+    let socketCreated = 0;
+    const sidecar = await startSidecar(() => createMcpServer(configFor(0), () => {
+      socketCreated += 1;
+      return new FakeObsSocket();
+    }, undefined, store));
+    const client = await connectClient(sidecar, "configuration-during-recording-test");
+
+    const result = await client.callTool({
+      arguments: { newSource: { inputName: "Phone" }, targetRef: "scenecap-target-v1.WyJ3aW5kb3ciLDQyXQ" },
+      name: "configure_capture_target",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).toContain("recording transition is active");
+    expect(socketCreated).toBe(0);
+    await client.close();
+  });
 });
 
 class PreviewFakeObsSocket implements ObsSocket {

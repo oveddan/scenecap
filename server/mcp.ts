@@ -12,7 +12,7 @@ import {
   CapturePreviewError,
   previewCaptureTarget,
 } from "./capture-preview.js";
-import { CaptureSessionStore } from "./capture-session.js";
+import { CaptureSessionMutationError, CaptureSessionStore } from "./capture-session.js";
 import { decodeCaptureTargetRef, readCaptureTargets } from "./capture-targets.js";
 import { ConfigError, loadObsConfig, type ObsConfig, type SidecarConfig } from "./config.js";
 import { classifyObsFailure, readObsStatus, type ObsSocketFactory } from "./obs.js";
@@ -84,6 +84,10 @@ export function createMcpServer(
       try {
         const result = await sessionStore.runExclusive(async () => {
           try {
+            // This check is intentionally inside the same shared critical
+            // section as configuration and recording transitions. It must run
+            // before configuration opens an OBS socket or sends a mutation.
+            sessionStore.assertConfigurationMutable();
             const configuration = await configureCaptureTarget(
               await loadObs(),
               request,
@@ -352,6 +356,9 @@ export function curatedCaptureTargetFailureReason(error: unknown): string {
 }
 
 export function curatedCaptureConfigurationFailureReason(error: unknown): string {
+  if (error instanceof CaptureSessionMutationError) {
+    return "A recording transition is active; stop or recover it before changing capture configuration.";
+  }
   if (error instanceof CaptureConfigurationAmbiguousCreationError) {
     return "OBS input creation may be partially applied; inspect get_session before retrying or removing the named input manually.";
   }

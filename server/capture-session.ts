@@ -69,6 +69,13 @@ export interface RecordingSession {
   state: "active" | "start_ambiguous" | "stop_ambiguous";
 }
 
+export class CaptureSessionMutationError extends Error {
+  constructor() {
+    super("Cannot change capture configuration while a recording transition is active.");
+    this.name = "CaptureSessionMutationError";
+  }
+}
+
 /** Private restoration data retained only by the singleton sidecar. */
 export interface CaptureSessionRestoreSnapshot {
   configuredSourceRef: string;
@@ -105,9 +112,7 @@ export class CaptureSessionStore {
   }
 
   record(configuration: ConfiguredCaptureSource, restoreSnapshot: CaptureSessionRestoreSnapshot): CaptureSession {
-    if (this.#session.recording) {
-      throw new Error("Cannot change capture configuration while a recording transition is active.");
-    }
+    this.assertConfigurationMutable();
     const previous = this.#session.configuredSources.find(
       (candidate) => candidate.source.sourceRef === configuration.source.sourceRef,
     );
@@ -135,9 +140,7 @@ export class CaptureSessionStore {
   }
 
   recordUnresolvedCreation(creation: UnresolvedCaptureCreation): CaptureSession {
-    if (this.#session.recording) {
-      throw new Error("Cannot change capture configuration while a recording transition is active.");
-    }
+    this.assertConfigurationMutable();
     const unresolvedCreations = [
       ...this.#session.unresolvedCreations.filter((candidate) => candidate.inputName !== creation.inputName),
       structuredClone(creation),
@@ -161,6 +164,10 @@ export class CaptureSessionStore {
       },
     };
     return this.read();
+  }
+
+  assertConfigurationMutable(): void {
+    if (this.#session.recording) throw new CaptureSessionMutationError();
   }
 
   setRecordingState(state: RecordingSession["state"]): CaptureSession {

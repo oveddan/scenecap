@@ -1,7 +1,7 @@
 import { stat } from "node:fs/promises";
 
 import type { CaptureSession, CaptureSessionStore, RecordingSession } from "./capture-session.js";
-import { readCaptureTargets } from "./capture-targets.js";
+import { decodeCaptureTargetRef, decodeInputRef } from "./capture-targets.js";
 import type { ObsConfig } from "./config.js";
 import {
   boundedObsRead,
@@ -98,6 +98,10 @@ export async function stopRecording(
   try {
     await connect(socket, config, options, deadline);
     if (!await recordActive(socket, options, deadline)) {
+      // The previous active state was sidecar-owned, but a missing active OBS
+      // output could mean an external stop or a lost event. Retain ownership
+      // evidence and block a later start from accidentally adopting it.
+      store.setRecordingState("stop_ambiguous");
       throw new RecordingControlError("ambiguous_recording_state", "OBS no longer reports the scenecap recording as active.");
     }
     store.setRecordingState("stop_ambiguous");
@@ -145,16 +149,39 @@ async function assertConfigurationCurrent(
   options: Required<ObsReadOptions>,
   deadline: number,
 ): Promise<void> {
-  const discovery = await readCaptureTargets(config, createSocket, {
-    signal: options.signal,
-    timeoutMs: remainingTimeout(deadline),
-  });
-  const current = new Map(discovery.sources.map((source) => [source.sourceRef, source]));
-  for (const configured of session.configuredSources) {
-    const source = current.get(configured.source.sourceRef);
-    if (!source || source.configuredTargetRef !== configured.target.targetRef) {
-      throw new RecordingControlError("stale_configuration", "A configured capture source changed in OBS; configure it again before recording.");
+  const socket = createSocket();
+  try {
+    await connect(socket, config, options, deadline);
+    const inputList = await boundedObsRead(socket, () => socket.request({ type: "GetInputList" }), options, deadline);
+    const inputs = arrayField(inputList, "inputs");
+    for (const configured of session.configuredSources) {
+      const inputUuid = decodeInputRef(configured.source.sourceRef);
+      if (!inputUuid) throw staleConfiguration();
+      const input = inputs.find((candidate) => objectString(candidate, "inputUuid") === inputUuid);
+      if (!input || objectString(input, "inputKind") !== configured.source.inputKind) throw staleConfiguration();
+      const inputName = objectString(input, "inputName");
+      if (!inputName) throw staleConfiguration();
+      const settings = await boundedObsRead(
+        socket,
+        () => socket.request({ data: { inputName }, type: "GetInputSettings" }),
+        options,
+        deadline,
+      );
+      if (!settingsMatchTarget(configured.source.inputKind, configured.target.targetRef, objectRecord(settings, "inputSettings"))) {
+        throw staleConfiguration();
+      }
+      const sceneItems = await boundedObsRead(
+        socket,
+        () => socket.request({ data: { sceneName: configured.scene.sceneName }, type: "GetSceneItemList" }),
+        options,
+        deadline,
+      );
+      if (!arrayField(sceneItems, "sceneItems").some((item) => objectString(item, "sourceUuid") === inputUuid)) {
+        throw staleConfiguration();
+      }
     }
+  } finally {
+    void Promise.resolve(socket.disconnect()).catch(() => undefined);
   }
 }
 
@@ -209,8 +236,34 @@ function objectField(value: unknown, key: string): unknown {
     : undefined;
 }
 
-function remainingTimeout(deadline: number): number {
-  return Math.max(0, deadline - Date.now());
+function settingsMatchTarget(inputKind: string, targetRef: string, settings: Record<string, unknown>): boolean {
+  const target = decodeCaptureTargetRef(targetRef);
+  if (!target) return false;
+  if (inputKind === "screen_capture") {
+    const type = settings.type === undefined ? 0 : settings.type;
+    return (target.kind === "display" && type === 0 && settings.display_uuid === target.value)
+      || (target.kind === "window" && type === 1 && settings.window === target.value)
+      || (target.kind === "application" && type === 2 && settings.application === target.value);
+  }
+  return (inputKind === "av_capture_input_v2" || inputKind === "macos-avcapture")
+    && target.kind === "camera"
+    && settings.device === target.value;
+}
+
+function staleConfiguration(): RecordingControlError {
+  return new RecordingControlError("stale_configuration", "A configured capture source changed in OBS; configure it again before recording.");
+}
+
+function arrayField(value: unknown, key: string): unknown[] {
+  const candidate = objectField(value, key);
+  return Array.isArray(candidate) ? candidate : [];
+}
+
+function objectRecord(value: unknown, key: string): Record<string, unknown> {
+  const candidate = objectField(value, key);
+  return candidate !== null && typeof candidate === "object" && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : {};
 }
 
 function isDefinitiveObsRequestRejection(error: unknown): boolean {
