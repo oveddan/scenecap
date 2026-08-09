@@ -39,6 +39,7 @@ export type ObsReadRequest =
   | { type: "GetReplayBufferStatus" }
   | { type: "GetVirtualCamStatus" }
   | { data: { inputName: string }; type: "GetInputSettings" }
+  | { data: { sceneName: string }; type: "GetSceneItemList" }
   | {
       data: { inputName: string; propertyName: CapturePropertyName };
       type: "GetInputPropertiesListPropertyItems";
@@ -81,7 +82,34 @@ export type ObsPreviewRequest =
       type: "SetSceneItemEnabled";
     };
 
-export type ObsRequest = ObsReadRequest | ObsPreviewRequest;
+/**
+ * Configuration has its own closed mutation vocabulary.  The caller can
+ * choose only a validated capture target, an existing opaque input reference,
+ * or the name and allowlisted kind of a new capture input.  It cannot pass an
+ * arbitrary OBS request or settings object through the sidecar.
+ */
+export type ObsConfigurationRequest =
+  | {
+      data: {
+        inputName: string;
+        inputSettings: Record<string, number | string>;
+        overlay: true;
+      };
+      type: "SetInputSettings";
+    }
+  | {
+      data: {
+        inputKind: "av_capture_input_v2" | "macos-avcapture" | "screen_capture";
+        inputName: string;
+        inputSettings: Record<string, number | string>;
+        sceneItemEnabled: true;
+        sceneName: string;
+      };
+      type: "CreateInput";
+    }
+  | { data: { sceneName: string; sourceName: string }; type: "CreateSceneItem" };
+
+export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest;
 
 export interface ObsSocket {
   connect(options: ObsConnectionOptions): Promise<void>;
@@ -139,6 +167,8 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("GetVirtualCamStatus");
       case "GetInputSettings":
         return this.#socket.call("GetInputSettings", request.data);
+      case "GetSceneItemList":
+        return this.#socket.call("GetSceneItemList", request.data);
       case "GetInputPropertiesListPropertyItems":
         // OBS 32.2.1 on macOS crashes when this request contains only an
         // inputUuid. Always send the current input name and a property from
@@ -164,6 +194,10 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("SetCurrentPreviewScene", request.data);
       case "SetSceneItemEnabled":
         return this.#socket.call("SetSceneItemEnabled", request.data);
+      case "SetInputSettings":
+        return this.#socket.call("SetInputSettings", request.data);
+      case "CreateSceneItem":
+        return this.#socket.call("CreateSceneItem", request.data);
     }
   }
 

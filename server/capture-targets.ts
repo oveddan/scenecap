@@ -20,6 +20,8 @@ export type CaptureTargetKind = "application" | "camera" | "display" | "window";
 
 export type CaptureTargetValue = number | string;
 
+export type SupportedCaptureInputKind = "av_capture_input_v2" | "macos-avcapture" | "screen_capture";
+
 export interface DecodedCaptureTargetRef {
   kind: CaptureTargetKind;
   value: CaptureTargetValue;
@@ -75,7 +77,10 @@ interface PropertyProbe {
 
 const WINDOW_PROBE: PropertyProbe = { kind: "window", propertyName: "window" };
 
-const CAMERA_INPUT_KINDS = new Set(["av_capture_input_v2", "macos-avcapture"]);
+const CAMERA_INPUT_KINDS = new Set<string>([
+  "av_capture_input_v2",
+  "macos-avcapture",
+]);
 
 export async function readCaptureTargets(
   config: ObsConfig,
@@ -287,8 +292,15 @@ function isSupportedCaptureInput(input: ObsInput): boolean {
   return isSupportedCaptureInputKind(input.inputKind);
 }
 
-function isSupportedCaptureInputKind(inputKind: string): boolean {
+export function isSupportedCaptureInputKind(inputKind: string): inputKind is SupportedCaptureInputKind {
   return inputKind === "screen_capture" || CAMERA_INPUT_KINDS.has(inputKind);
+}
+
+export function isCompatibleCaptureInputKind(
+  targetKind: CaptureTargetKind,
+  inputKind: SupportedCaptureInputKind,
+): boolean {
+  return targetKind === "camera" ? CAMERA_INPUT_KINDS.has(inputKind) : inputKind === "screen_capture";
 }
 
 function screenProbeGroups(inputs: InputSnapshot[]): InputSnapshot[][] {

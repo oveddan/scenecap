@@ -18,8 +18,8 @@ reference and regression evidence; it is not deleted as part of the
 migration. FFmpeg is no longer in the capture path. `ffprobe` may remain an
 optional, best-effort post-recording validator where it adds useful evidence.
 
-The TypeScript server exposes one explicit, sensitive preview action in
-addition to read-only discovery. `get_status` reports OBS/version,
+The TypeScript server exposes persistent capture configuration in addition to
+read-only discovery and sensitive preview. `get_status` reports OBS/version,
 screen-capture capability, and Source Record filter capability.
 `list_capture_targets` reports configured capture inputs and the currently
 selectable windows without changing OBS. `preview_capture_target` accepts only
@@ -35,6 +35,19 @@ cannot safely expose over WebSocket; already-configured selections remain
 visible when OBS reports their explicit target identifiers. Recording state
 and output reporting remain later status evolution, after recording controls
 exist.
+
+`configure_capture_target` accepts one opaque target reference from discovery
+and either an opaque existing source reference or a validated name for a new
+allowlisted capture input. It persistently updates or creates that source in
+OBS and ensures it belongs to the selected existing scene, or the current
+Program scene by default. `get_session` reports the shared sidecar-owned
+configuration session: a stable session ID, revision, configured source and
+target references, scene identities, and a non-secret recovery summary. This
+is the cross-client contract for later recording and restoration tools. When
+an intended output size is supplied, configuration rounds it up to an even
+encoder-safe size and records that intent. It does not alter camera presets or
+scene transforms, which could crop, distort, or select an unsupported device
+mode; per-source Source Record configuration will apply that intent later.
 
 On OBS 32.2.1 for macOS, `GetInputPropertiesListPropertyItems` can crash OBS
 when called with only an input UUID, or when obs-websocket serializes some
@@ -153,7 +166,7 @@ The server will continue adding narrow tools rather than a generic OBS
 passthrough:
 
 - `preview_capture_target`
-- `configure_session` and `get_session`
+- `configure_capture_target` and `get_session`
 - `start_recording` and `stop_recording`
 - `restore_obs_state`
 
@@ -179,6 +192,12 @@ when an OBS source has an odd or otherwise unsupported size.
   reported with conflict-specific manual recovery guidance. Temporary probes
   are serialized in this sidecar, but that does not coordinate other OBS
   clients.
+- `configure_capture_target` accepts only discovered opaque references and
+  allowlisted capture kinds; it never passes raw OBS settings through MCP. The
+  sidecar retains recovery data privately and `get_session` exposes only a
+  non-secret summary. If a later scene attachment fails after OBS accepted a
+  target update, the tool records a partial state and requires inspection
+  before retrying rather than assuming OBS reverted it.
 - Future recording mutation tools will snapshot temporary OBS state before
   changing it and restore it on request or safe cleanup.
 - Future recording tools will report the final output path and, when

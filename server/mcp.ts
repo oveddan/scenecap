@@ -2,10 +2,16 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
+  CaptureConfigurationError,
+  CaptureConfigurationPartialError,
+  configureCaptureTarget,
+} from "./capture-config.js";
+import {
   CapturePreviewCleanupError,
   CapturePreviewError,
   previewCaptureTarget,
 } from "./capture-preview.js";
+import { CaptureSessionStore } from "./capture-session.js";
 import { decodeCaptureTargetRef, readCaptureTargets } from "./capture-targets.js";
 import { ConfigError, loadObsConfig, type ObsConfig, type SidecarConfig } from "./config.js";
 import { classifyObsFailure, readObsStatus, type ObsSocketFactory } from "./obs.js";
@@ -16,8 +22,112 @@ export function createMcpServer(
   config: SidecarConfig,
   createSocket?: ObsSocketFactory,
   loadObs: () => Promise<ObsConfig> = config.obs ? async () => config.obs as ObsConfig : loadObsConfig,
+  sessionStore: CaptureSessionStore = new CaptureSessionStore(),
 ): McpServer {
   const server = new McpServer(SERVER_INFO);
+
+  server.registerTool(
+    "get_session",
+    {
+      title: "Get configured capture session",
+      description:
+        "Read the sidecar-owned configured capture session and recovery summary. This does not connect to or mutate OBS.",
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ server: SERVER_INFO, session: sessionStore.read(), status: "ok" }),
+        },
+      ],
+    }),
+  );
+
+  server.registerTool(
+    "configure_capture_target",
+    {
+      title: "Persistently configure one OBS capture target",
+      description:
+        "Point one allowlisted OBS capture input at a current target returned by list_capture_targets, creating a named capture input only when requested. The source is added to the chosen existing scene, or the current Program scene by default. This persists in OBS and records non-secret recovery metadata in the shared sidecar session.",
+      inputSchema: {
+        targetRef: z.string().min(1).max(2_100),
+        sourceRef: z.string().min(1).max(1_100).optional(),
+        newSource: z.object({
+          inputName: z.string().min(1).max(300),
+          inputKind: z.enum(["screen_capture", "av_capture_input_v2", "macos-avcapture"]).optional(),
+        }).strict().optional(),
+        sceneName: z.string().min(1).max(300).optional(),
+        encoderDimensions: z.object({
+          width: z.number().int().min(1).max(16_384),
+          height: z.number().int().min(1).max(16_384),
+        }).strict().optional(),
+      },
+      annotations: {
+        destructiveHint: true,
+        openWorldHint: false,
+        readOnlyHint: false,
+      },
+    },
+    async (request, extra) => {
+      let partialSession: ReturnType<CaptureSessionStore["read"]> | undefined;
+      let partialConfiguration: CaptureConfigurationPartialError["configuration"] | undefined;
+      try {
+        const result = await sessionStore.runExclusive(async () => {
+          try {
+            const configuration = await configureCaptureTarget(
+              await loadObs(),
+              request,
+              createSocket,
+              { signal: extra.signal },
+            );
+            const session = sessionStore.record(configuration.configuredSource, configuration.restoreSnapshot);
+            return { configuration, session };
+          } catch (error) {
+            if (error instanceof CaptureConfigurationPartialError) {
+              partialConfiguration = error.configuration;
+              partialSession = sessionStore.record(error.configuration.configuredSource, error.configuration.restoreSnapshot);
+            }
+            throw error;
+          }
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                configuredSource: result.configuration.configuredSource,
+                ...(result.configuration.encoderSafeDimensions
+                  ? { encoderSafeDimensions: result.configuration.encoderSafeDimensions }
+                  : {}),
+                server: SERVER_INFO,
+                session: result.session,
+                status: "ok",
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                ...(partialConfiguration ? { configuredSource: partialConfiguration.configuredSource } : {}),
+                ...(partialSession ? { session: partialSession } : {}),
+                reason: curatedCaptureConfigurationFailureReason(error),
+                server: SERVER_INFO,
+                status: "unavailable",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
 
   server.registerTool(
     "get_status",
@@ -163,6 +273,33 @@ export function curatedCaptureTargetFailureReason(error: unknown): string {
     cancelled: "OBS capture target discovery was cancelled.",
     timeout: "OBS capture target discovery timed out.",
     unknown: "OBS capture target discovery failed for an unknown reason.",
+  });
+}
+
+export function curatedCaptureConfigurationFailureReason(error: unknown): string {
+  if (error instanceof CaptureConfigurationPartialError) {
+    return error.outcome === "scene_attachment_rejected"
+      ? "OBS updated the capture target but rejected adding it to the scene; inspect get_session before retrying."
+      : "OBS configuration may be partially applied; inspect get_session before retrying or restoring it manually.";
+  }
+  if (error instanceof CaptureConfigurationError) {
+    switch (error.kind) {
+      case "incompatible_source":
+        return "The selected OBS source cannot capture that target.";
+      case "invalid_reference":
+        return "The capture target or source reference is invalid.";
+      case "invalid_request":
+        return "The capture configuration request is invalid.";
+      case "source_unavailable":
+        return "The requested OBS source or scene is no longer available; list targets again.";
+      case "stale_reference":
+        return "The capture target is no longer available; list targets again.";
+    }
+  }
+  return curatedObsFailureReason(error, {
+    cancelled: "OBS capture configuration was cancelled.",
+    timeout: "OBS capture configuration timed out.",
+    unknown: "OBS capture configuration failed for an unknown reason.",
   });
 }
 

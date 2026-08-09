@@ -80,16 +80,19 @@ Then introduce narrow tools in this order:
    and existing OBS capture sources; never require guessed identifiers.
 2. `preview_capture_target` — provide a safe preview/description to confirm a
    selected display, window, or camera before recording.
-3. `configure_session` and `get_session` — express intended capture outputs,
-   including Source Record, a phone camera, and multi-display capture.
+3. `configure_capture_target` and `get_session` — persist one discovered
+   target on an allowlisted OBS input, record a shared recovery contract, and
+   express intended capture outputs including a phone camera and multi-display
+   capture. Source Record settings remain the next extension of this session.
 4. `start_recording` and `stop_recording` — explicit recording mutations with
    ownership and output reporting.
 5. `restore_obs_state` — restore a snapshot after temporary configuration.
 
-Source configuration must handle encoder-safe dimensions. If a source's size
-is unsupported by the selected encoder, the sidecar should surface and apply a
+Source configuration records encoder-safe aligned dimensions for later output
+configuration. When it applies encoder settings, the sidecar must use that
 documented aligned-dimension workaround rather than creating a recording that
-silently fails or is distorted.
+silently fails or is distorted; it must not blindly alter a camera preset or
+scene transform to achieve alignment.
 
 ## Migration status
 
