@@ -92,6 +92,49 @@ describe("Source Record filter configuration", () => {
     expect(socket.requests).toEqual([{ data: { sourceName: "Terminal" }, type: "GetSourceFilterList" }]);
   });
 
+  it("updates and re-enables a disabled scenecap-owned Source Record filter", async () => {
+    const filterName = sourceRecordFilterName(source.inputUuid);
+    const socket = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterList") {
+        return { filters: [{ filterEnabled: false, filterKind: "source_record_filter", filterName }] };
+      }
+      if (request.type === "SetSourceFilterSettings" || request.type === "SetSourceFilterEnabled") return {};
+      throw new Error(`Unexpected request ${request.type}`);
+    });
+
+    await configureSourceRecordFilter(socket, source, undefined, options, deadline);
+
+    expect(socket.requests).toEqual([
+      { data: { sourceName: "Terminal" }, type: "GetSourceFilterList" },
+      {
+        data: { filterName, filterSettings: { record_mode: 3 }, overlay: true, sourceName: "Terminal" },
+        type: "SetSourceFilterSettings",
+      },
+      {
+        data: { filterEnabled: true, filterName, sourceName: "Terminal" },
+        type: "SetSourceFilterEnabled",
+      },
+    ]);
+  });
+
+  it("does not send an enable mutation for an already enabled owned filter", async () => {
+    const filterName = sourceRecordFilterName(source.inputUuid);
+    const socket = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterList") {
+        return { filters: [{ filterEnabled: true, filterKind: "source_record_filter", filterName }] };
+      }
+      if (request.type === "SetSourceFilterSettings") return {};
+      throw new Error(`Unexpected request ${request.type}`);
+    });
+
+    await configureSourceRecordFilter(socket, source, undefined, options, deadline);
+
+    expect(socket.requests.map((request) => request.type)).toEqual([
+      "GetSourceFilterList",
+      "SetSourceFilterSettings",
+    ]);
+  });
+
   it("reports an ambiguous attempted mutation without claiming it was absent", async () => {
     const socket = new FakeSocket((request) => {
       if (request.type === "GetSourceFilterList") return { filters: [] };

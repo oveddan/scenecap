@@ -133,6 +133,10 @@ export type ObsSourceRecordRequest =
         sourceName: string;
       };
       type: "SetSourceFilterSettings";
+    }
+  | {
+      data: { filterEnabled: true; filterName: string; sourceName: string };
+      type: "SetSourceFilterEnabled";
     };
 
 export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest | ObsSourceRecordRequest;
@@ -230,6 +234,8 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("CreateSourceFilter", request.data);
       case "SetSourceFilterSettings":
         return this.#socket.call("SetSourceFilterSettings", request.data);
+      case "SetSourceFilterEnabled":
+        return this.#socket.call("SetSourceFilterEnabled", request.data);
     }
   }
 

@@ -53,6 +53,7 @@ export class SourceRecordConfigurationError extends Error {
 }
 
 interface SourceFilter {
+  filterEnabled?: boolean;
   filterKind: string;
   filterName: string;
 }
@@ -102,6 +103,15 @@ export async function configureSourceRecordFilter(
         data: { filterName, filterSettings, overlay: true, sourceName: source.inputName },
         type: "SetSourceFilterSettings",
       }), options, deadline);
+      // Updating settings does not change an existing filter's enabled state.
+      // Re-enable only the deterministic filter we own, and only when OBS
+      // explicitly reports it disabled. This avoids touching user filters.
+      if (existing.filterEnabled === false) {
+        await boundedObsRead(socket, () => socket.request({
+          data: { filterEnabled: true, filterName, sourceName: source.inputName },
+          type: "SetSourceFilterEnabled",
+        }), options, deadline);
+      }
     } else {
       await boundedObsRead(socket, () => socket.request({
         data: {
@@ -163,7 +173,11 @@ function filters(response: unknown): SourceFilter[] {
   if (!isRecord(response) || !Array.isArray(response.filters)) return [];
   return response.filters.flatMap((candidate) => {
     if (!isRecord(candidate) || typeof candidate.filterName !== "string" || typeof candidate.filterKind !== "string") return [];
-    return [{ filterKind: candidate.filterKind, filterName: candidate.filterName }];
+    return [{
+      ...(typeof candidate.filterEnabled === "boolean" ? { filterEnabled: candidate.filterEnabled } : {}),
+      filterKind: candidate.filterKind,
+      filterName: candidate.filterName,
+    }];
   });
 }
 
