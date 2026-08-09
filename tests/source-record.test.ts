@@ -135,6 +135,22 @@ describe("Source Record filter configuration", () => {
     ]);
   });
 
+  it.each([
+    ["a definitive OBS rejection", Object.assign(new Error("invalid request"), { code: 500 }), "lookup_rejected"],
+    ["an ambiguous lookup timeout", new Error("socket closed"), "lookup_ambiguous"],
+  ] as const)("classifies %s before any filter mutation", async (_label, failure, kind) => {
+    const socket = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterList") throw failure;
+      throw new Error(`Unexpected request ${request.type}`);
+    });
+
+    await expect(configureSourceRecordFilter(socket, source, undefined, options, deadline)).rejects.toMatchObject({
+      kind,
+      mutationAttempted: false,
+    } satisfies Partial<SourceRecordConfigurationError>);
+    expect(socket.requests).toEqual([{ data: { sourceName: "Terminal" }, type: "GetSourceFilterList" }]);
+  });
+
   it("reports an ambiguous attempted mutation without claiming it was absent", async () => {
     const socket = new FakeSocket((request) => {
       if (request.type === "GetSourceFilterList") return { filters: [] };

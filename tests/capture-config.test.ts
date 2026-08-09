@@ -312,6 +312,47 @@ describe("configureCaptureTarget", () => {
     expect(JSON.stringify({ result, session: store.read() })).not.toContain(config.password);
     expect(mutation.connectedWith?.password).toBe(config.password);
   });
+
+  it("retains a capture recovery snapshot when Source Record filter lookup fails", async () => {
+    const sourceRef = encodeInputRef("screen-input-uuid");
+    const discovery = discoverySocket({ inputName: "Screen", inputUuid: "screen-input-uuid", configuredWindow: 41 });
+    const mutation = new FakeSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
+      if (request.type === "GetCurrentProgramScene") {
+        return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
+      }
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Screen", inputUuid: "screen-input-uuid" }] };
+      }
+      if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
+      if (request.type === "SetInputSettings") return {};
+      if (request.type === "GetSceneItemList") return { sceneItems: [{ sceneItemId: 8, sourceUuid: "screen-input-uuid" }] };
+      if (request.type === "GetSourceFilterList") throw new Error("socket closed during filter lookup");
+      throw new Error(`Unexpected configuration request ${request.type}`);
+    });
+    const sockets = [discovery, mutation];
+
+    const partial = await configureCaptureTarget(config, { sourceRef, targetRef: windowTargetRef }, () => nextSocket(sockets))
+      .catch((error: unknown) => error);
+
+    expect(partial).toBeInstanceOf(CaptureConfigurationPartialError);
+    expect(partial).toMatchObject({
+      configuration: {
+        configuredSource: {
+          configurationState: "partial_recovery_required",
+          recovery: { input: "restore_previous_target", mutationOutcome: "unknown" },
+          source: { sourceRef },
+        },
+        restoreSnapshot: {
+          configuredSourceRef: sourceRef,
+          previousInputSettings: { type: 1, window: 41 },
+          sceneItemId: 8,
+        },
+      },
+      outcome: "unknown",
+    });
+    expect(JSON.stringify(partial)).not.toContain(config.password);
+  });
 });
 
 function discoverySocket(options: {

@@ -39,6 +39,8 @@ export type SourceRecordConfigurationErrorKind =
   | "capability_unavailable"
   | "filter_collision"
   | "invalid_settings"
+  | "lookup_ambiguous"
+  | "lookup_rejected"
   | "mutation_ambiguous"
   | "mutation_rejected";
 
@@ -86,13 +88,21 @@ export async function configureSourceRecordFilter(
 ): Promise<SourceRecordConfiguration> {
   const normalized = normalizeOptions(requested);
   const filterName = sourceRecordFilterName(source.inputUuid);
-  const response = await boundedObsRead(
-    socket,
-    () => socket.request({ data: { sourceName: source.inputName }, type: "GetSourceFilterList" }),
-    options,
-    deadline,
-  );
-  const existing = filters(response).find((filter) => filter.filterName === filterName);
+  let existing: SourceFilter | undefined;
+  try {
+    const response = await boundedObsRead(
+      socket,
+      () => socket.request({ data: { sourceName: source.inputName }, type: "GetSourceFilterList" }),
+      options,
+      deadline,
+    );
+    existing = filters(response).find((filter) => filter.filterName === filterName);
+  } catch (error) {
+    throw new SourceRecordConfigurationError(
+      isDefinitiveObsRequestRejection(error) ? "lookup_rejected" : "lookup_ambiguous",
+      false,
+    );
+  }
   if (existing && existing.filterKind !== SOURCE_RECORD_FILTER_KIND) {
     throw new SourceRecordConfigurationError("filter_collision", false);
   }
