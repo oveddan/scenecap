@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import {
+  CaptureConfigurationAmbiguousCreationError,
   CaptureConfigurationError,
   CaptureConfigurationPartialError,
   configureCaptureTarget,
@@ -89,6 +90,9 @@ export function createMcpServer(
             if (error instanceof CaptureConfigurationPartialError) {
               partialConfiguration = error.configuration;
               partialSession = sessionStore.record(error.configuration.configuredSource, error.configuration.restoreSnapshot);
+            }
+            if (error instanceof CaptureConfigurationAmbiguousCreationError) {
+              partialSession = sessionStore.recordUnresolvedCreation(error.creation);
             }
             throw error;
           }
@@ -277,6 +281,9 @@ export function curatedCaptureTargetFailureReason(error: unknown): string {
 }
 
 export function curatedCaptureConfigurationFailureReason(error: unknown): string {
+  if (error instanceof CaptureConfigurationAmbiguousCreationError) {
+    return "OBS input creation may be partially applied; inspect get_session before retrying or removing the named input manually.";
+  }
   if (error instanceof CaptureConfigurationPartialError) {
     return error.outcome === "scene_attachment_rejected"
       ? "OBS updated the capture target but rejected adding it to the scene; inspect get_session before retrying."

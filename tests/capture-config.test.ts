@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CaptureConfigurationAmbiguousCreationError,
   CaptureConfigurationError,
   CaptureConfigurationPartialError,
   alignEncoderDimensions,
@@ -197,6 +198,77 @@ describe("configureCaptureTarget", () => {
     const store = new CaptureSessionStore();
     store.record(partial.configuration.configuredSource, partial.configuration.restoreSnapshot);
     expect(store.read().configuredSources[0]?.configurationState).toBe("partial_recovery_required");
+  });
+
+  it("re-queries a fresh OBS connection and tracks an ambiguously created input without guessing deletion ownership", async () => {
+    const discovery = discoverySocket({ inputName: "Probe", inputUuid: "probe-uuid", configuredWindow: 41 });
+    const primary = new FakeSocket((request) => {
+      if (request.type === "GetCurrentProgramScene") {
+        return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
+      }
+      if (request.type === "GetInputList") return { inputs: [] };
+      if (request.type === "CreateInput") throw new Error("socket closed after create");
+      throw new Error(`Unexpected creation request ${request.type}`);
+    });
+    const recovery = new FakeSocket((request) => {
+      if (request.type === "GetInputList") {
+        return { inputs: [{ inputKind: "screen_capture", inputName: "Terminal", inputUuid: "created-uuid" }] };
+      }
+      throw new Error(`Unexpected recovery request ${request.type}`);
+    });
+    const sockets = [discovery, primary, recovery];
+
+    let partial: CaptureConfigurationPartialError | undefined;
+    try {
+      await configureCaptureTarget(config, {
+        newSource: { inputName: "Terminal" },
+        targetRef: windowTargetRef,
+      }, () => nextSocket(sockets));
+    } catch (error) {
+      if (error instanceof CaptureConfigurationPartialError) partial = error;
+      else throw error;
+    }
+
+    expect(partial?.configuration.configuredSource).toMatchObject({
+      configurationState: "partial_recovery_required",
+      recovery: {
+        input: "manual_confirmation_required",
+        mutationOutcome: "unknown",
+        sceneItem: "manual_confirmation_required",
+      },
+      source: { inputName: "Terminal", sourceRef: encodeInputRef("created-uuid") },
+    });
+    expect(primary.disconnected).toBe(true);
+    expect(recovery.disconnected).toBe(true);
+  });
+
+  it("returns named manual-recovery tracking when a fresh lookup cannot resolve an ambiguous creation", async () => {
+    const discovery = discoverySocket({ inputName: "Probe", inputUuid: "probe-uuid", configuredWindow: 41 });
+    const primary = new FakeSocket((request) => {
+      if (request.type === "GetCurrentProgramScene") {
+        return { currentProgramSceneName: "Record", currentProgramSceneUuid: "scene-uuid" };
+      }
+      if (request.type === "GetInputList") return { inputs: [] };
+      if (request.type === "CreateInput") throw new Error("socket closed after create");
+      throw new Error(`Unexpected creation request ${request.type}`);
+    });
+    const recovery = new FakeSocket(() => {
+      throw new Error("fresh OBS connection failed");
+    });
+    const sockets = [discovery, primary, recovery];
+
+    await expect(configureCaptureTarget(config, {
+      newSource: { inputName: "Terminal" },
+      targetRef: windowTargetRef,
+    }, () => nextSocket(sockets))).rejects.toMatchObject({
+      creation: {
+        inputKind: "screen_capture",
+        inputName: "Terminal",
+        recovery: "manual_confirmation_required",
+        scene: { sceneName: "Record", sceneUuid: "scene-uuid" },
+        target: { kind: "window", targetRef: windowTargetRef },
+      },
+    } satisfies Partial<CaptureConfigurationAmbiguousCreationError>);
   });
 
   it("keeps OBS credentials out of configuration results and session reads", async () => {

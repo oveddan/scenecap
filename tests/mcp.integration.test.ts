@@ -409,7 +409,7 @@ describe("MCP HTTP sidecar", () => {
     const sourceRef = "scenecap-input-v1.c2NyZWVuLWlucHV0LXV1aWQ";
 
     const configured = await client.callTool({
-      arguments: { sourceRef, targetRef },
+      arguments: { encoderDimensions: { height: 1_081, width: 1_919 }, sourceRef, targetRef },
       name: "configure_capture_target",
     });
     expect(configured.isError).not.toBe(true);
@@ -417,6 +417,7 @@ describe("MCP HTTP sidecar", () => {
     expect(JSON.parse((configured as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? "{}")).toMatchObject({
       configuredSource: {
         configurationState: "configured",
+        encoderSafeDimensions: { adjusted: true, alignment: 2, height: 1_082, width: 1_920 },
         scene: { sceneName: "Record", sceneUuid: "record-uuid" },
         source: { configuredTargetRef: targetRef, sourceRef },
       },
@@ -429,7 +430,10 @@ describe("MCP HTTP sidecar", () => {
     expect(sessionText).not.toContain("restoreSnapshot");
     expect(JSON.parse(sessionText)).toMatchObject({
       session: {
-        configuredSources: [expect.objectContaining({ source: expect.objectContaining({ sourceRef }) })],
+        configuredSources: [expect.objectContaining({
+          encoderSafeDimensions: { adjusted: true, alignment: 2, height: 1_082, width: 1_920 },
+          source: expect.objectContaining({ sourceRef }),
+        })],
         revision: 1,
       },
     });

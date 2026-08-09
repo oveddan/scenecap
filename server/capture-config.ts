@@ -4,6 +4,7 @@ import type {
   CaptureSessionRestoreSnapshot,
   CaptureSessionScene,
   ConfiguredCaptureSource,
+  UnresolvedCaptureCreation,
 } from "./capture-session.js";
 import {
   decodeCaptureTargetRef,
@@ -20,6 +21,7 @@ import {
 import {
   boundedObsRead,
   createObsSocket,
+  disconnectObsQuietly,
   isAbortSignal,
   normalizeObsReadOptions,
   type ObsReadOptions,
@@ -28,6 +30,7 @@ import {
 } from "./obs.js";
 
 export const DEFAULT_CAPTURE_CONFIGURATION_TIMEOUT_MS = 20_000;
+export const CAPTURE_CONFIGURATION_RECOVERY_TIMEOUT_MS = 5_000;
 export const ENCODER_DIMENSION_ALIGNMENT = 2;
 
 export interface EncoderDimensions {
@@ -99,6 +102,14 @@ export class CaptureConfigurationPartialError extends CaptureConfigurationError 
   }
 }
 
+/** OBS may have created an input, but a fresh lookup could not identify it safely. */
+export class CaptureConfigurationAmbiguousCreationError extends CaptureConfigurationError {
+  constructor(readonly creation: UnresolvedCaptureCreation) {
+    super("source_unavailable", "OBS input creation may have succeeded but could not be verified.");
+    this.name = "CaptureConfigurationAmbiguousCreationError";
+  }
+}
+
 interface ObsInput {
   inputKind: string;
   inputName: string;
@@ -148,11 +159,24 @@ export async function configureCaptureTarget(
     const scene = await resolveScene(socket, request.sceneName, options, deadline);
     const operation = request.sourceRef
       ? await updateExistingInput(socket, request.sourceRef, target, scene, options, deadline)
-      : await createNewInput(socket, request.newSource as NewCaptureSource, target, scene, options, deadline);
+      : await createNewInput(
+        config,
+        socket,
+        request.newSource as NewCaptureSource,
+        target,
+        scene,
+        createSocket,
+        options,
+        deadline,
+      );
     const { restoreSnapshot, ...configuredSource } = operation;
+    const encoderSafeDimensions = request.encoderDimensions ? alignEncoderDimensions(request.encoderDimensions) : undefined;
     return {
-      configuredSource,
-      ...(request.encoderDimensions ? { encoderSafeDimensions: alignEncoderDimensions(request.encoderDimensions) } : {}),
+      configuredSource: {
+        ...configuredSource,
+        ...(encoderSafeDimensions ? { encoderSafeDimensions } : {}),
+      },
+      ...(encoderSafeDimensions ? { encoderSafeDimensions } : {}),
       restoreSnapshot,
     };
   } finally {
@@ -258,10 +282,12 @@ async function updateExistingInput(
 }
 
 async function createNewInput(
+  config: ObsConfig,
   socket: ObsSocket,
   newSource: NewCaptureSource,
   target: CaptureTarget,
   scene: CaptureSessionScene,
+  createSocket: ObsSocketFactory,
   options: Required<ObsReadOptions>,
   deadline: number,
 ): Promise<ConfiguredCaptureSource & { restoreSnapshot: CaptureSessionRestoreSnapshot }> {
@@ -278,24 +304,30 @@ async function createNewInput(
   if (existingInputs.some((input) => input.inputName === newSource.inputName)) {
     throw new CaptureConfigurationError("invalid_request", "An OBS input already uses that name; select it by sourceRef instead.");
   }
-  const response = await boundedObsRead(
-    socket,
-    () => socket.request({
-      data: {
-        inputKind,
-        inputName: newSource.inputName,
-        inputSettings: targetSettings(target),
-        sceneItemEnabled: true,
-        sceneName: scene.sceneName,
-      },
-      type: "CreateInput",
-    }),
-    options,
-    deadline,
-  );
+  let response: unknown;
+  try {
+    response = await boundedObsRead(
+      socket,
+      () => socket.request({
+        data: {
+          inputKind,
+          inputName: newSource.inputName,
+          inputSettings: targetSettings(target),
+          sceneItemEnabled: true,
+          sceneName: scene.sceneName,
+        },
+        type: "CreateInput",
+      }),
+      options,
+      deadline,
+    );
+  } catch (error) {
+    if (isDefinitiveObsRequestRejection(error)) throw error;
+    return recoverAmbiguousCreatedInput(config, socket, newSource, inputKind, target, scene, createSocket);
+  }
   const inputUuid = objectString(response, "inputUuid");
   if (!inputUuid) {
-    throw new CaptureConfigurationError("source_unavailable", "OBS did not return the configured source identity.");
+    return recoverAmbiguousCreatedInput(config, socket, newSource, inputKind, target, scene, createSocket);
   }
   const source = captureSource({ inputKind, inputName: newSource.inputName, inputUuid }, requestSourceRef(inputUuid), target.targetRef);
   const sceneItemId = objectInteger(response, "sceneItemId");
@@ -309,6 +341,81 @@ async function createNewInput(
     scene,
     source,
     target: publicTarget(target),
+  };
+}
+
+async function recoverAmbiguousCreatedInput(
+  config: ObsConfig,
+  primarySocket: ObsSocket,
+  newSource: NewCaptureSource,
+  inputKind: SupportedCaptureInputKind,
+  target: CaptureTarget,
+  scene: CaptureSessionScene,
+  createSocket: ObsSocketFactory,
+): Promise<never> {
+  // A response timeout/cancellation does not say whether OBS applied the
+  // mutation. Close the original connection and use a new one so a stale
+  // request queue cannot be mistaken for an absence proof.
+  disconnectObsQuietly(primarySocket);
+  const recoverySocket = createSocket();
+  const recoveryOptions = normalizeObsReadOptions({ timeoutMs: CAPTURE_CONFIGURATION_RECOVERY_TIMEOUT_MS });
+  const recoveryDeadline = Date.now() + recoveryOptions.timeoutMs;
+  try {
+    await connect(recoverySocket, config, recoveryOptions, recoveryDeadline);
+    const inputs = parseInputs(await boundedObsRead(
+      recoverySocket,
+      () => recoverySocket.request({ type: "GetInputList" }),
+      recoveryOptions,
+      recoveryDeadline,
+    ));
+    const input = inputs.find((candidate) => candidate.inputName === newSource.inputName);
+    if (!input) {
+      // A fresh, successful list is an absence proof: no durable input is
+      // left to track, so fail normally rather than issuing a duplicate.
+      throw new CaptureConfigurationError("source_unavailable", "OBS did not confirm the configured source identity.");
+    }
+    if (input.inputKind === inputKind) {
+      const source = captureSource(input, requestSourceRef(input.inputUuid), target.targetRef);
+      throw new CaptureConfigurationPartialError({
+        configuredSource: {
+          configurationState: "partial_recovery_required",
+          recovery: {
+            input: "manual_confirmation_required",
+            mutationOutcome: "unknown",
+            sceneItem: "manual_confirmation_required",
+          },
+          scene,
+          source,
+          target: publicTarget(target),
+        },
+        restoreSnapshot: { configuredSourceRef: source.sourceRef },
+      }, "unknown");
+    }
+    throw new CaptureConfigurationAmbiguousCreationError(unresolvedCreation(newSource, inputKind, target, scene));
+  } catch (error) {
+    if (
+      error instanceof CaptureConfigurationError
+      || error instanceof CaptureConfigurationPartialError
+      || error instanceof CaptureConfigurationAmbiguousCreationError
+    ) throw error;
+    throw new CaptureConfigurationAmbiguousCreationError(unresolvedCreation(newSource, inputKind, target, scene));
+  } finally {
+    disconnectObsQuietly(recoverySocket);
+  }
+}
+
+function unresolvedCreation(
+  newSource: NewCaptureSource,
+  inputKind: SupportedCaptureInputKind,
+  target: CaptureTarget,
+  scene: CaptureSessionScene,
+): UnresolvedCaptureCreation {
+  return {
+    inputKind,
+    inputName: newSource.inputName,
+    recovery: "manual_confirmation_required",
+    scene,
+    target: { kind: target.kind, targetRef: target.targetRef },
   };
 }
 
