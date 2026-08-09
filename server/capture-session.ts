@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import type { EncoderSafeDimensions } from "./capture-config.js";
 import type { CaptureSource, CaptureTarget } from "./capture-targets.js";
+import type { SourceRecordConfiguration } from "./source-record.js";
 
 export interface CaptureSessionScene {
   sceneName: string;
@@ -16,7 +17,7 @@ export interface CaptureSessionScene {
 export interface CaptureSessionRecovery {
   input: "manual_confirmation_required" | "remove_created_input" | "restore_previous_target";
   /** Whether all configuration mutations were confirmed by OBS. */
-  mutationOutcome: "confirmed" | "scene_attachment_rejected" | "unknown";
+  mutationOutcome: "confirmed" | "scene_attachment_rejected" | "source_record_filter_rejected" | "unknown";
   previousTargetRef?: string;
   sceneItem:
     | "manual_confirmation_required"
@@ -31,6 +32,7 @@ export interface ConfiguredCaptureSource {
   recovery: CaptureSessionRecovery;
   scene: CaptureSessionScene;
   source: CaptureSource;
+  sourceRecord?: SourceRecordConfiguration;
   target: Pick<CaptureTarget, "availability" | "kind" | "label" | "targetRef" | "validity">;
 }
 
@@ -175,6 +177,6 @@ function moreSevereOutcome(
   left: CaptureSessionRecovery["mutationOutcome"],
   right: CaptureSessionRecovery["mutationOutcome"],
 ): CaptureSessionRecovery["mutationOutcome"] {
-  const severity = { confirmed: 0, scene_attachment_rejected: 1, unknown: 2 } as const;
+  const severity = { confirmed: 0, scene_attachment_rejected: 1, source_record_filter_rejected: 1, unknown: 2 } as const;
   return severity[left] >= severity[right] ? left : right;
 }

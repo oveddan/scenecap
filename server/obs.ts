@@ -40,6 +40,7 @@ export type ObsReadRequest =
   | { type: "GetVirtualCamStatus" }
   | { data: { inputName: string }; type: "GetInputSettings" }
   | { data: { sceneName: string }; type: "GetSceneItemList" }
+  | { data: { sourceName: string }; type: "GetSourceFilterList" }
   | {
       data: { inputName: string; propertyName: CapturePropertyName };
       type: "GetInputPropertiesListPropertyItems";
@@ -109,7 +110,32 @@ export type ObsConfigurationRequest =
     }
   | { data: { sceneName: string; sourceName: string }; type: "CreateSceneItem" };
 
-export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest;
+/**
+ * Source Record is a third-party OBS filter, so this vocabulary names only
+ * that one allowlisted kind and a small, portable subset of its settings.
+ */
+export type ObsSourceRecordRequest =
+  | {
+      data: {
+        filterEnabled: true;
+        filterKind: "source_record_filter";
+        filterName: string;
+        filterSettings: Record<string, boolean | number | string>;
+        sourceName: string;
+      };
+      type: "CreateSourceFilter";
+    }
+  | {
+      data: {
+        filterName: string;
+        filterSettings: Record<string, boolean | number | string>;
+        overlay: true;
+        sourceName: string;
+      };
+      type: "SetSourceFilterSettings";
+    };
+
+export type ObsRequest = ObsReadRequest | ObsPreviewRequest | ObsConfigurationRequest | ObsSourceRecordRequest;
 
 export interface ObsSocket {
   connect(options: ObsConnectionOptions): Promise<void>;
@@ -169,6 +195,8 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("GetInputSettings", request.data);
       case "GetSceneItemList":
         return this.#socket.call("GetSceneItemList", request.data);
+      case "GetSourceFilterList":
+        return this.#socket.call("GetSourceFilterList", request.data);
       case "GetInputPropertiesListPropertyItems":
         // OBS 32.2.1 on macOS crashes when this request contains only an
         // inputUuid. Always send the current input name and a property from
@@ -198,6 +226,10 @@ export class ObsWebSocketAdapter implements ObsSocket {
         return this.#socket.call("SetInputSettings", request.data);
       case "CreateSceneItem":
         return this.#socket.call("CreateSceneItem", request.data);
+      case "CreateSourceFilter":
+        return this.#socket.call("CreateSourceFilter", request.data);
+      case "SetSourceFilterSettings":
+        return this.#socket.call("SetSourceFilterSettings", request.data);
     }
   }
 

@@ -386,6 +386,7 @@ describe("MCP HTTP sidecar", () => {
       throw new Error(`Unexpected discovery request ${request.type}`);
     });
     const mutation = new PreviewFakeObsSocket((request) => {
+      if (request.type === "GetSourceFilterKindList") return { sourceFilterKinds: ["source_record_filter"] };
       if (request.type === "GetCurrentProgramScene") {
         return { currentProgramSceneName: "Record", currentProgramSceneUuid: "record-uuid" };
       }
@@ -395,6 +396,8 @@ describe("MCP HTTP sidecar", () => {
       if (request.type === "GetInputSettings") return { inputSettings: { type: 1, window: 41 } };
       if (request.type === "SetInputSettings") return {};
       if (request.type === "GetSceneItemList") return { sceneItems: [{ sceneItemId: 5, sourceUuid: "screen-input-uuid" }] };
+      if (request.type === "GetSourceFilterList") return { filters: [] };
+      if (request.type === "CreateSourceFilter") return {};
       throw new Error(`Unexpected mutation request ${request.type}`);
     });
     const sockets = [discovery, mutation];

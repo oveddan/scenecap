@@ -83,13 +83,14 @@ Then introduce narrow tools in this order:
 3. `configure_capture_target` and `get_session` — persist one discovered
    target on an allowlisted OBS input, record a shared recovery contract, and
    express intended capture outputs including a phone camera and multi-display
-   capture. Source Record settings remain the next extension of this session.
+   capture. Configure an owned per-source Source Record filter with inherited
+   OBS-profile defaults and bounded output overrides.
 4. `start_recording` and `stop_recording` — explicit recording mutations with
    ownership and output reporting.
 5. `restore_obs_state` — restore a snapshot after temporary configuration.
 
-Source configuration records encoder-safe aligned dimensions for later output
-configuration. When it applies encoder settings, the sidecar must use that
+Source configuration applies encoder-safe aligned dimensions only to its
+per-source Source Record encoder. When it applies encoder settings, the sidecar must use that
 documented aligned-dimension workaround rather than creating a recording that
 silently fails or is distorted; it must not blindly alter a camera preset or
 scene transform to achieve alignment.
